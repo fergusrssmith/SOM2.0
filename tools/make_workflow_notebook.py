@@ -23,10 +23,11 @@ zone, self-organising map (SOM) and well calibration. **Only the features fed to
 | | **SOM1.0** (multi-attribute) | **SOM2.0** (embedding) |
 |---|---|---|
 | Input features | ~36 single-trace instantaneous + banded attributes computed from the seismic | 768-channel embedding from the NCS seismic foundation model ([NorskRegnesentral/NCS_models](https://github.com/NorskRegnesentral/NCS_models)) |
-| Reduction | PCA used to **select** the dominant 8–12 attributes, then z-score | PCA to *k* components (12 and 32 tested) |
-| Classification | 8 × 8 SOM, batch algorithm | identical |
+| Input selection | PCA-guided choice of **distinct** attributes (no two with \|r\| ≥ 0.8), added until they reconstruct 90 % of the variance of all attributes; the SOM runs on the attribute values | PCs of the 2.5D embedding capturing 70 % of its variance (PCs are uncorrelated, so nothing is double counted) |
+| Classification | 8 × 8 SOM (Kohonen map), batch algorithm | identical |
 | Calibration | SOM nodes → well facies: biggest winner, and probabilistic (neighbour-smoothed) | identical |
 | Scoring | leave-one-well-out at the well trace | identical |
+| Deliverable | facies, confidence and P(oil sand) volumes (SEG-Y) | identical |
 
 **The idea in one sentence:** a seismic attribute describes one trace over a few samples. An embedding from a model
 pre-trained on thousands of seismic surveys describes each location *in the context of its surroundings*:
@@ -43,7 +44,7 @@ from pathlib import Path
 
 DATA = Path(r"C:\Data\Test")                                    # local data root (nothing is uploaded)
 SEISMIC = DATA / "SEGY" / "1988_AVO18.sgy"                       # base seismic volume used by both workflows
-NCS_FEATURES = DATA / "SEGY" / "1988_AVO18_ncs_features_dens44.zarr"   # NCS embedding of the same volume
+NCS_FEATURES = DATA / "SEGY" / "1988_AVO18_ncs_25d_dir0_dens4"         # NCS 2.5D embedding of the same volume (densify 4)
 LAS_DIR = DATA / "LAS"                                           # well facies logs in TWT (one LAS per well)
 FACIES_CURVE = "elastic_lithofluid_facies_upscaled"              # seismic-scale facies curve used for scoring
 RAW_FACIES_CURVE = "elastic_lithofluid_facies"                   # raw curve, shown for context only
@@ -54,7 +55,10 @@ FACIES_NAMES = {1: "Brine sand", 2: "Soft shale", 3: "Shale", 4: "Oil sand", 7: 
 FACIES_COLOURS = {1: "#4e9fd6", 2: "#9a8c6a", 3: "#7a7a7a", 4: "#e8b33a", 7: "#b07cc6", 8: "#3d3d3d",
                   10: "#c2410c"}
 SOM_SHAPE = (8, 8)
-NCS_K = (12, 32)                 # numbers of PCA components tested for SOM2.0
+ATTR_R_MAX = 0.8                 # SOM1.0: no two selected attributes correlated |r| >= this
+ATTR_VAR_TARGET = 0.90           # SOM1.0: add distinct attributes until they reconstruct this share of all-attribute variance
+NCS_PC_VAR = 0.70                # SOM2.0: embedding variance captured by the PCs fed to the SOM
+OUTPUT_DIR = DATA / "SEGY" / "som_outputs"                        # facies / confidence / P(oil sand) volumes
 CAL_RADIUS = 1                   # calibration uses the (2r+1)^2 traces around each well; scoring uses the well trace
 SEED = 0
 """)
@@ -188,19 +192,25 @@ md(r"""
 ## 4 · SOM1.0: multi-attribute workflow
 The attributes are single-trace instantaneous attributes (envelope, phase, frequency, sweetness, thin bed,
 bandwidth, Q, attenuation, relative acoustic impedance and others) and *banded* attributes (averages between
-phase breaks or envelope breaks), all computed from the single base volume. PCA is then used to **pick the
-attributes** that dominate the leading eigenvectors, and the SOM runs on those attributes.
+phase breaks or envelope breaks), all computed from the single base volume.
+
+**Selecting the SOM inputs without double counting.** Walk the principal components in order. From each, take the
+attribute with the highest loading, unless it correlates |r| ≥ 0.8 with an attribute already chosen. Stop when the
+chosen attributes reconstruct 90% of the variance of *all* attributes. The number of attributes falls out of the
+data instead of being fixed, and near-duplicates (for example sweetness and its banded versions) can't all get in.
+The SOM then runs on the selected attribute values, not on PC scores.
 """)
 code(r"""
 with som2.timer("SOM1.0 attributes"):
     attr_names, X = som2.som1_attributes(cube, dt_ms, mask)
 pca1 = som2.pca_fit(X)
-sel_idx, sel_names = som2.som1_select(pca1, attr_names)
+sel_idx, sel_names, sel_r2 = som2.select_distinct(X, attr_names, ATTR_R_MAX, ATTR_VAR_TARGET, seed=SEED)
 Z1 = ((X[:, sel_idx] - X[:, sel_idx].mean(0)) / (X[:, sel_idx].std(0) + 1e-9)).astype(np.float32)
 pc1_rgb = sp.rgb_from_scores(som2.pca_transform(X, pca1, 3))          # for the colour-blend QC below
-print(len(attr_names), "attributes computed; PCA-selected for the SOM:", sel_names)
+print(f"{len(attr_names)} attributes computed; {len(sel_idx)} distinct attributes reconstruct {sel_r2[-1]:.0%} of their variance:")
+print(sel_names)
 """)
-md("### QC: how PCA picks the attributes")
+md("### QC: how the attributes are picked")
 code(r"""
 fig, ax = plt.subplots(1, 3, figsize=(18, 8), gridspec_kw={"width_ratios": [1.1, 1, 1]})
 L = np.abs(pca1["comps"][:6]).T
@@ -214,16 +224,15 @@ corr = np.corrcoef(Z1[np.random.default_rng(0).choice(len(Z1), 200_000, replace=
 im = ax[1].imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1); plt.colorbar(im, ax=ax[1], fraction=0.046)
 ax[1].set_xticks(range(len(sel_names)), sel_names, rotation=60, ha="right", fontsize=7)
 ax[1].set_yticks(range(len(sel_names)), sel_names, fontsize=7); ax[1].set_title("Correlation between the selected attributes")
-n = min(36, len(pca1["var_ratio"])); ax[2].bar(range(1, n + 1), pca1["var_ratio"][:n], color="steelblue")
-a2 = ax[2].twinx(); a2.plot(range(1, n + 1), np.cumsum(pca1["var_ratio"][:n]), "k-"); a2.set_ylim(0, 1); a2.set_ylabel("cumulative")
-ax[2].set(title="Variance explained per component", xlabel="principal component")
+sp.selection_curve(ax[2], sel_names, sel_r2, ATTR_VAR_TARGET, "Variance of all attributes reconstructed\nas distinct attributes are added")
 plt.tight_layout(); plt.show()
 """)
 md(r"""
 *How to read it:* left, each row is an attribute and each column a principal component. Dark means the attribute
 drives that component. The red attributes are the ones PCA selection keeps. Middle, how strongly the selected
-attributes correlate with each other: large red blocks mean several of them measure the same thing (for example
-envelope, energy and sweetness). That is a known weakness of selecting by variance. Right, variance per component.
+attributes correlate with each other. With the distinct rule, no off-diagonal cell reaches ±0.8, so no
+attribute is counted twice. Right, how much of the variance of all attributes the selection reconstructs as each
+attribute is added, stopping at the dashed target.
 """)
 md("### QC: the selected attributes on the section")
 code(r"""
@@ -240,29 +249,45 @@ plt.tight_layout(); plt.show()
 del X
 """)
 md(r"""
-*How to read it:* each panel is one attribute that goes into the SOM, shown inside the zone along the line through
-the wells. Several look alike: they carry the same information.
+*How to read it:* the first six attributes that go into the SOM, shown inside the zone along the line through
+the wells. Each adds information the others don't.
 """)
 code(r"""
 with som2.timer("SOM1.0 SOM"):
     W1, snaps1 = som2.train_som(Z1, SOM_SHAPE, seed=SEED)
     b1 = som2.bmu(Z1, W1)
+fig = sp.component_planes(W1, sel_names, SOM_SHAPE, f"SOM1.0 Kohonen map: component planes of the {len(sel_names)} input attributes (red = high)",
+                          max_n=len(sel_names))
+plt.show()
+""")
+md(r"""
+*How to read it:* each small map is the trained 8 × 8 Kohonen map coloured by one input attribute. Neurons in the
+same position on every plane are the same neuron. Attributes whose planes look alike vary together across the
+map; a plane with its own distinct pattern carries its own information. Where several planes are extreme together
+(the same corner red in several maps), that group of neurons represents seismic with that combination of
+character.
 """)
 
 # =====================================================================================================
 md(r"""
 ## 5 · SOM2.0: foundation-model embedding
 The embedding comes from the NCS model: a ViT encoder with masked-autoencoder pre-training on public Norwegian
-Continental Shelf seismic. To create it for a new volume:
+Continental Shelf seismic. We use the **2.5D** model. It runs the encoder along four vertical directions (inline,
+crossline and the two diagonals) and combines them, so each vector also reflects the geology across the section.
+The 2D model processes sections independently. To create the embedding for a new volume:
 
 ```python
-som2.run_ncs(SEISMIC, "features.zarr", model="NorskRegnesentralSTI/NCS-v1-2d-base", densify=4)   # GPU recommended
+som2.run_ncs(SEISMIC, "features.zarr", model="NorskRegnesentralSTI/NCS-v1-2.5d-base", densify=4)   # GPU recommended
 ```
 
 **Registration:** the store's `inline/xline/time_depth` coordinates are 0-based sample indices of the input
 volume, at the patch start + `patch_size // 2`. The true patch centre is therefore half a sample earlier. The
-features are interpolated from that grid onto the seismic samples of the zone. PCA is fitted on a regular sub-grid
-of embedding vectors.
+features are interpolated from that grid onto the seismic samples of the zone.
+
+**Why PCs, and how many.** Individual embedding channels aren't meaningful the way attributes are: the information
+is spread across combinations of channels. So the SOM gets principal components, which are uncorrelated by
+construction (no double counting). The embedding spreads its variance widely: 8 PCs capture under 20%, 70% needs
+roughly 90 PCs, and 90% needs over 200. We use the PCs that capture 70%.
 """)
 code(r"""
 ds = som2.open_ncs(NCS_FEATURES)
@@ -282,14 +307,21 @@ ref = En[well_pos[ref_w], ref_t]
 print(f"embedding grid {dict(F.sizes)}; reference point: {ref_w} at {twt[ref_t + t0]:.0f} ms")
 """)
 code(r"""
-som2_runs = {}
-for k in NCS_K:
-    with som2.timer(f"SOM2.0 k={k}"):
-        pca2, _, Z2 = som2.ncs_pcs_on_zone(ds, mask, ilines, xlines, twt, k)
-        W2, snaps2 = som2.train_som(Z2, SOM_SHAPE, seed=SEED)
-        som2_runs[k] = dict(pca=pca2, W=W2, b=som2.bmu(Z2, W2), rgb=sp.rgb_from_scores(Z2))
-    print(f"k={k}: {pca2['var_ratio'][:k].sum():.0%} of embedding variance")
-K2 = max(NCS_K)
+with som2.timer("SOM2.0"):
+    pca2, k2, Z2 = som2.ncs_pcs_on_zone(ds, mask, ilines, xlines, twt, NCS_PC_VAR)
+    W2, snaps2 = som2.train_som(Z2, SOM_SHAPE, seed=SEED)
+    b2 = som2.bmu(Z2, W2)
+rgb2 = sp.rgb_from_scores(Z2)
+NAME2 = f"SOM2.0 ({k2} PCs)"
+print(f"SOM2.0 input: {k2} PCs = {pca2['var_ratio'][:k2].sum():.0%} of embedding variance")
+fig = sp.component_planes(W2, [f"PC{i + 1}" for i in range(k2)], SOM_SHAPE,
+                          f"SOM2.0 Kohonen map: component planes of the first 24 of {k2} embedding PCs (red = high)")
+plt.show()
+del Z2
+""")
+md(r"""
+*How to read it:* the same Kohonen component-plane view for SOM2.0, one map per embedding PC. The leading PCs
+organise the map into broad smooth regions; later PCs add finer distinctions within them.
 """)
 md("### QC: what the embedding sees")
 code(r"""
@@ -305,7 +337,7 @@ ax[1].plot(well_pos[ref_w], twt[ref_t + t0], "w*", ms=16, mec="k")
 ax[1].set_title(f"Cosine similarity to the embedding at the star ({ref_w}, oil sand): red = 'looks the same' to the model", loc="left", fontsize=9)
 ax[2].imshow(sp.rgb_line(pc1_rgb, zone_index, path, t0, t1), aspect="auto", extent=[0, len(path), twt[t1 - 1], twt[t0]])
 ax[2].set_title("SOM1.0 features: first 3 attribute PCs as red/green/blue", loc="left", fontsize=9)
-ax[3].imshow(sp.rgb_line(som2_runs[K2]["rgb"], zone_index, path, t0, t1), aspect="auto", extent=[0, len(path), twt[t1 - 1], twt[t0]])
+ax[3].imshow(sp.rgb_line(rgb2, zone_index, path, t0, t1), aspect="auto", extent=[0, len(path), twt[t1 - 1], twt[t0]])
 ax[3].set_title("SOM2.0 features: first 3 embedding PCs as red/green/blue", loc="left", fontsize=9)
 for a in ax:
     sp.decorate_line(a, trange, well_pos, top, base, path, label=(a is ax[0]))
@@ -322,7 +354,7 @@ md(r"""
 """)
 code(r"""
 fig, ax = plt.subplots(1, 2, figsize=(13, 3.4))
-for a, (title, v, k) in zip(ax, [("SOM1.0 attributes", pca1["var_ratio"], len(sel_idx)), ("SOM2.0 embedding", som2_runs[K2]["pca"]["var_ratio"], K2)]):
+for a, (title, v, k) in zip(ax, [("SOM1.0 attributes", pca1["var_ratio"], len(sel_idx)), ("SOM2.0 embedding", pca2["var_ratio"], k2)]):
     n = min(40, len(v)); a.bar(range(1, n + 1), v[:n], color=["gold" if i < k else "steelblue" for i in range(n)])
     a2 = a.twinx(); a2.plot(range(1, n + 1), np.cumsum(v[:n]), "k-"); a2.set_ylim(0, 1)
     a.set(title=f"{title}: variance per component", xlabel="component")
@@ -331,7 +363,8 @@ plt.tight_layout(); plt.show()
 md(r"""
 *How to read it:* the attribute PCA is steep. A few components carry most of the variance, because many
 attributes measure the same thing. The embedding spectrum is much flatter, so more components are needed to
-represent it. That's why SOM2.0 is tested with both 12 and 32 components (gold bars = 32 used).
+represent it. Gold bars are the components used: the selected attributes for SOM1.0 (shown against the attribute
+PCs for scale), and the PCs up to 70% for SOM2.0.
 """)
 
 # =====================================================================================================
@@ -344,7 +377,7 @@ grid.
 code(r"""
 nodes_rgb = som2.node_colours(SOM_SHAPE)
 fig, ax = plt.subplots(2, 3, figsize=(13, 8.5))
-for r, (name, W, b) in enumerate([("SOM1.0", W1, b1), (f"SOM2.0 (k={K2})", som2_runs[K2]["W"], som2_runs[K2]["b"])]):
+for r, (name, W, b) in enumerate([("SOM1.0", W1, b1), (NAME2, W2, b2)]):
     hits = np.bincount(b, minlength=W.shape[0])
     sp.node_grid(ax[r, 0], hits / hits.sum() * 100, SOM_SHAPE, "Greens", f"{name}: % of zone samples per node", fmt=lambda v: f"{v:.1f}")
     sp.node_grid(ax[r, 1], sp.u_matrix(W, SOM_SHAPE), SOM_SHAPE, "bone_r", f"{name}: U-matrix (dark = cluster boundary)")
@@ -361,7 +394,7 @@ md(r"""
 """)
 code(r"""
 fig, ax = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
-for a, (name, b) in zip(ax, [("SOM1.0", b1), (f"SOM2.0 (k={K2})", som2_runs[K2]["b"])]):
+for a, (name, b) in zip(ax, [("SOM1.0", b1), (NAME2, b2)]):
     a.imshow(sp.rgb_line(nodes_rgb[b] / 255, zone_index, path, t0, t1), aspect="auto", extent=[0, len(path), twt[t1 - 1], twt[t0]])
     sp.decorate_line(a, trange, well_pos, top, base, path); a.set_title(f"{name}: unsupervised SOM classes (64 nodes; no wells used yet)", loc="left", fontsize=9)
 plt.tight_layout(); plt.show()
@@ -386,7 +419,7 @@ code(r"""
 zi_all, fa_all = som2.calibration_samples(wells, zone_index, CAL_RADIUS)
 calib = {}
 fig, ax = plt.subplots(2, 3, figsize=(15, 9.5))
-for r, (name, b) in enumerate([("SOM1.0", b1), (f"SOM2.0 (k={K2})", som2_runs[K2]["b"])]):
+for r, (name, b) in enumerate([("SOM1.0", b1), (NAME2, b2)]):
     cnt, win, post = som2.calibrate(b[zi_all], fa_all, SOM_SHAPE[0] * SOM_SHAPE[1], n_fac, SOM_SHAPE)
     calib[name] = post
     sp.node_facies_bars(ax[r, 0], cnt, SOM_SHAPE, fac_cmap, f"{name}: well samples per node (hatched = none)")
@@ -413,7 +446,7 @@ For each well in turn, the nodes are calibrated with the *other* wells and the h
 the honest test: the scored well never influenced its own prediction.
 """)
 code(r"""
-runs = {"SOM1.0": b1, **{f"SOM2.0 (k={k})": r["b"] for k, r in som2_runs.items()}}
+runs = {"SOM1.0": b1, NAME2: b2}
 rows, per_well, lowo_scores = [], {}, {}
 for name, b in runs.items():
     scores, pw = som2.leave_one_well_out(b, wells, zone_index, n_fac, SOM_SHAPE, CAL_RADIUS)
@@ -426,7 +459,7 @@ scores_df = pd.DataFrame(rows)
 display(scores_df.style.format(precision=2, subset=scores_df.columns[2:]).hide(axis="index"))
 """)
 code(r"""
-best2 = f"SOM2.0 (k={K2})"
+best2 = NAME2
 prob = scores_df[scores_df.calibration == "prob"].set_index("workflow")
 fig, ax = plt.subplots(1, 4, figsize=(19, 4.6), gridspec_kw={"width_ratios": [1.1, 1.3, 1, 1]})
 prob[[f"acc {w}" for w in wells] + ["accuracy"]].T.rename(index=lambda s: s.replace("acc ", "")).plot.bar(ax=ax[0], rot=0)
@@ -465,7 +498,7 @@ md(r"""
 """)
 code(r"""
 fig, ax = plt.subplots(4, 1, figsize=(14, 13.5), sharex=True)
-for r, (name, b) in enumerate([("SOM1.0", b1), (best2, som2_runs[K2]["b"])]):
+for r, (name, b) in enumerate([("SOM1.0", b1), (best2, b2)]):
     post = calib[name][b]
     sp.seismic_line(ax[2 * r], cube, path, twt, t0, t1)
     sp.overlay(ax[2 * r], sp.zone_to_line(post.argmax(1).astype(float), zone_index, path, t0, t1), path, twt, t0, t1, fac_cmap, -0.5, n_fac - 0.5, 0.82)
@@ -488,11 +521,11 @@ t_oil = np.concatenate([twt[w[2][w[3] == oil]] - top[w[0][0], w[1][0]] for w in 
 offset = float(np.median(t_oil)) if len(t_oil) else 40.0
 fig, ax = plt.subplots(1, 3, figsize=(17, 5.2))
 ext = [xlines[0], xlines[-1], ilines[-1], ilines[0]]
-for a, (name, b) in zip(ax[:2], [("SOM1.0", b1), (best2, som2_runs[K2]["b"])]):
+for a, (name, b) in zip(ax[:2], [("SOM1.0", b1), (best2, b2)]):
     m = sp.horizon_slice(calib[name][b].argmax(1).astype(float), zone_index, top, offset, twt)
     a.imshow(m, cmap=fac_cmap, vmin=-0.5, vmax=n_fac - 0.5, extent=ext, aspect="auto", interpolation="nearest")
     a.set_title(f"{name}: facies {offset:.0f} ms below the top horizon")
-m = sp.horizon_slice(calib[best2][som2_runs[K2]["b"]][:, oil], zone_index, top, offset, twt)
+m = sp.horizon_slice(calib[best2][b2][:, oil], zone_index, top, offset, twt)
 im = ax[2].imshow(m, cmap="YlOrBr", vmin=0, vmax=1, extent=ext, aspect="auto"); plt.colorbar(im, ax=ax[2], label="P(oil sand)")
 ax[2].set_title(f"{best2}: probability of oil sand")
 for a in ax:
@@ -507,9 +540,29 @@ md(r"""
 wells. Look for coherent bodies with plausible shapes and edges, rather than salt-and-pepper noise.
 """)
 
+
+md(r"""
+## 10 · Facies volumes
+The deliverable of the interpretation exercise: the well-calibrated labels transferred to every sample of the zone,
+written as SEG-Y with the geometry and trace headers of the input seismic. Calibration uses all wells (probabilistic).
+- `<workflow>_facies.sgy`: facies code (0 outside the zone)
+- `<workflow>_confidence.sgy`: probability of the most likely facies
+- `<workflow>_p_oil_sand.sgy`: probability of oil sand
+""")
+code(r"""
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+oil = code_to_k.get(4)
+for name, b in [("SOM1.0", b1), ("SOM2.0", b2)]:
+    post = calib[name if name == "SOM1.0" else NAME2][b]
+    som2.write_zone_volume(OUTPUT_DIR / f"{name}_facies.sgy", SEISMIC, mask, np.array(codes)[post.argmax(1)].astype(np.float32))
+    som2.write_zone_volume(OUTPUT_DIR / f"{name}_confidence.sgy", SEISMIC, mask, post.max(1).astype(np.float32))
+    if oil is not None:
+        som2.write_zone_volume(OUTPUT_DIR / f"{name}_p_oil_sand.sgy", SEISMIC, mask, post[:, oil].astype(np.float32))
+print("facies codes:", {c: FACIES_NAMES.get(c, c) for c in codes}, "| 0 = outside zone ->", OUTPUT_DIR)
+""")
 # =====================================================================================================
 md(r"""
-## 10 · Caveats
+## 11 · Caveats
 - **Few wells.** Leave-one-well-out with three wells (about 140 samples) gives noisy per-facies recalls, each
   resting on 10–50 samples. Read the per-well bars as well as the totals.
 - **Attribute set.** SOM1.0 uses the published formulas for standard single-trace and banded attributes, with
@@ -517,8 +570,12 @@ md(r"""
 - **Thin beds.** Facies thinner than a few milliseconds (tuff, carbonaceous) are below seismic resolution for both
   workflows.
 - **NCS model.** Each embedding vector summarises a 16 × 16-sample patch, so detail finer than about 64 ms vertically
-  comes only from where the patches are placed. The 2D model processes sections independently and can leave
-  tiling seams; the 2.5D model combines four directions and should reduce them.
+  comes only from where the patches are placed. The 2.5D model is used here; the 2D model processes sections
+  independently and can leave tiling seams.
+- **Alternatives tested.** Selecting raw embedding channels the SOM1.0 way, and SOM inputs built from cosine
+  similarity (to unsupervised k-means centres, or to facies prototypes from the calibration wells), scored below
+  embedding PCs. A k-nearest-neighbour classifier on the same PCs scored only slightly above the SOM, so with few
+  wells the SOM step itself costs little.
 - **Vertical wells and nearest-trace tie.** Deviated wells need per-sample inline/crossline positions.
 """)
 code(r"""

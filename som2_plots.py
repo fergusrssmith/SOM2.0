@@ -167,3 +167,30 @@ def confusion(ax, cm, names, title=""):
 
 def facies_cmap(codes, colours):
     return ListedColormap([colours.get(c, "#cccccc") for c in codes])
+
+
+def component_planes(W, labels, shape, title="", ncols=8, max_n=24):
+    """Kohonen component planes: one SOM-grid map per input variable (red = high). Returns the figure."""
+    n = min(len(labels), max_n)
+    rows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(rows, ncols, figsize=(1.9 * ncols, 2.0 * rows + 0.5))
+    for k, ax in enumerate(np.ravel(axes)):
+        if k < n:
+            ax.imshow(W[:, k].reshape(shape), cmap="RdBu_r", interpolation="nearest")
+            ax.set_title(labels[k], fontsize=7)
+        ax.set_xticks([]), ax.set_yticks([])
+        if k >= n:
+            ax.axis("off")
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
+def selection_curve(ax, names, r2, target, title=""):
+    """Variance of all candidates reconstructed as distinct variables are added."""
+    ax.plot(range(1, len(r2) + 1), r2, "o-", color="steelblue")
+    ax.axhline(target, color="k", ls="--", lw=1)
+    ax.set_xticks(range(1, len(r2) + 1), names, rotation=70, ha="right", fontsize=7)
+    ax.set_ylim(0, 1)
+    ax.set_ylabel("variance of all candidates reconstructed")
+    ax.set_title(title, fontsize=10)

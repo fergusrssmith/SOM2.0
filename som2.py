@@ -254,19 +254,31 @@ def som1_attributes(cube, dt_ms, mask, smooth_ms=20.0, energy_ms=44.0, break_ms=
     return names, X
 
 
-def som1_select(pca, names, n_min=8, n_max=12, rel=0.6, per_pc=5):
-    """SOM1.0 attribute selection by PCA: walk the eigenvectors in order and
-    keep each one's dominant attributes (|loading| >= rel x the largest), until n_min..n_max are chosen."""
-    chosen = []
-    for pc, comp in enumerate(pca["comps"]):
-        order = np.argsort(-np.abs(comp))
-        top = [i for i in order[:per_pc] if abs(comp[i]) >= rel * abs(comp[order[0]])]
-        for i in top:
-            if i not in chosen and len(chosen) < n_max:
-                chosen.append(int(i))
-        if len(chosen) >= n_min:
+def select_distinct(X, names, r_max=0.8, var_target=0.9, max_n=None, n_sample=200_000, seed=0):
+    """Pick influential AND distinct input variables (no double counting), with no fixed count.
+
+    Walk the principal components in order; from each, take its highest-loading variable that is not correlated
+    |r| >= r_max with any variable already chosen. Stop when the chosen set reconstructs `var_target` of the
+    total (standardised) variance of ALL candidate variables, i.e. tr(C[:, S] C[S, S]^-1 C[S, :]) / p, where C is
+    their correlation matrix, or when `max_n` is reached.
+    Returns (indices, names, r2_curve) with r2_curve[j] = variance reconstructed by the first j+1 picks."""
+    rng = np.random.default_rng(seed)
+    S = X[rng.choice(len(X), min(n_sample, len(X)), replace=False)].astype(np.float64)
+    p = pca_fit(S, n_fit=len(S), seed=seed)
+    C = np.corrcoef(((S - S.mean(0)) / (S.std(0) + 1e-9)).T)
+    chosen, r2 = [], []
+    for comp in p["comps"]:
+        for i in np.argsort(-np.abs(comp)):
+            if i in chosen or (chosen and np.max(np.abs(C[i, chosen])) >= r_max):
+                continue
+            chosen.append(int(i))
+            Cs = C[:, chosen]
+            r2.append(float(np.trace(Cs @ np.linalg.pinv(C[np.ix_(chosen, chosen)]) @ Cs.T) / C.shape[0]))
             break
-    return chosen, [names[i] for i in chosen]
+        if (r2 and r2[-1] >= var_target) or len(chosen) >= (max_n or X.shape[1]):
+            break
+    return chosen, [names[i] for i in chosen], r2
+
 
 # =====================================================================================
 # SOM2.0: NCS seismic foundation-model embedding
@@ -308,32 +320,57 @@ def _coord_to_index(coord, axis_values):
     return coord - 0.5
 
 
-def ncs_pcs_on_zone(ds, mask, ilines, xlines, twt, k_cfg, n_fit=200_000, seed=0):
-    """PCA of the 768-ch NCS features, then interpolate the k PCs onto the seismic zone samples."""
-    from scipy.interpolate import RegularGridInterpolator
-    F = ds["features"]
-    dims = list(F.dims)
-    il_c, xl_c, t_c = (np.asarray(ds[d].values, float) for d in dims[:3])
-    ni, nx, nt, nf = F.shape
-    with timer("ncs_pca_fit"):
-        step = max(1, int(np.ceil((ni * nx * nt / n_fit) ** (1 / 3))))   # regular sub-grid ~ n_fit vectors
-        S = np.asarray(F[::step, ::step, ::step].values, np.float32).reshape(-1, nf)
-        p = pca_fit(S, n_fit=len(S), seed=seed)
-        k = choose_k(p["var_ratio"], k_cfg)
-    with timer("ncs_pca_transform"):
-        PC = np.empty((ni, nx, nt, k), np.float32)
-        for i in range(ni):
-            PC[i] = pca_transform(F[i].values.reshape(-1, nf), p, k).reshape(nx, nt, k)
+def grid_to_zone_operator(ds, mask, ilines, xlines, twt):
+    """Trilinear interpolation from the NCS feature grid to every zone sample, built once: for each zone sample the
+    8 surrounding grid nodes (flat indices) and their weights. Apply with `interp_rows`."""
+    gi = _coord_to_index(ds["inline"].values, np.asarray(ilines, float))
+    gx = _coord_to_index(ds["xline"].values, np.asarray(xlines, float))
+    gt = _coord_to_index(ds["time_depth"].values, np.asarray(twt, float))
+    shp = (len(gi), len(gx), len(gt))
+    q = np.argwhere(mask).astype(float)
+
+    def axis(g, v):
+        j = np.clip(np.searchsorted(g, v) - 1, 0, len(g) - 2)
+        return j, np.clip((v - g[j]) / (g[j + 1] - g[j]), 0, 1)
+
+    (ji, fi), (jx, fx), (jt, ft) = axis(gi, q[:, 0]), axis(gx, q[:, 1]), axis(gt, q[:, 2])
+    corners, weights = [], []
+    for a in (0, 1):
+        for b in (0, 1):
+            for c in (0, 1):
+                corners.append(((ji + a) * shp[1] + (jx + b)) * shp[2] + (jt + c))
+                weights.append((fi if a else 1 - fi) * (fx if b else 1 - fx) * (ft if c else 1 - ft))
+    return np.stack(corners, 1).astype(np.int64), np.stack(weights, 1).astype(np.float32)
+
+
+def interp_rows(grid_values, operator, rows=None, chunk=200_000):
+    """grid_values (n_grid_nodes, c) -> values at the zone samples `rows` (all if None), via the operator."""
+    corners, weights = operator
+    rows = np.arange(len(corners)) if rows is None else np.asarray(rows)
+    out = np.empty((len(rows), grid_values.shape[1]), np.float32)
+    for s in range(0, len(rows), chunk):
+        r = rows[s:s + chunk]
+        out[s:s + chunk] = np.einsum("rk,rkc->rc", weights[r], grid_values[corners[r]])
+    return out
+
+
+def ncs_pcs_on_zone(ds, mask, ilines, xlines, twt, k_or_var=0.7, n_fit=120_000, seed=0):
+    """PCA of the 768-channel embedding, then the first k PCs on every zone sample.
+    `k_or_var`: an int = number of PCs, or a float < 1 = variance to capture (the embedding spreads its variance
+    widely, so ~0.7 needs tens to ~100 PCs). Returns (pca, k, Z)."""
+    with timer("ncs_load"):
+        G = np.asarray(ds["features"].values, np.float32)
+        G = G.reshape(-1, G.shape[-1])
+    with timer("ncs_pca"):
+        rng = np.random.default_rng(seed)
+        p = pca_fit(G[rng.choice(len(G), min(n_fit, len(G)), replace=False)], n_fit=n_fit, seed=seed)
+        k = choose_k(p["var_ratio"], k_or_var)
+        P = (((G - p["mean"]) / p["std"]) @ p["comps"][:k].T).astype(np.float32)
+        del G
     with timer("ncs_interp_to_seismic"):
-        gi = _coord_to_index(il_c, ilines.astype(float))
-        gx = _coord_to_index(xl_c, xlines.astype(float))
-        gt = _coord_to_index(t_c, twt)
-        pts = np.argwhere(mask).astype(float)
-        out = np.empty((len(pts), k), np.float32)
-        for c in range(k):
-            f = RegularGridInterpolator((gi, gx, gt), PC[..., c], bounds_error=False, fill_value=None)
-            out[:, c] = f(pts)
-    return p, k, out
+        Z = interp_rows(P, grid_to_zone_operator(ds, mask, ilines, xlines, twt))
+    return p, k, Z
+
 
 # =====================================================================================
 # PCA
@@ -350,11 +387,11 @@ def pca_fit(X, n_fit=300_000, seed=0):
     return dict(mean=mu, std=sd, comps=v.T, var_ratio=w / w.sum())
 
 
-def choose_k(var_ratio, k_cfg):
-    if isinstance(k_cfg, int):
-        return k_cfg
-    k = int(np.searchsorted(np.cumsum(var_ratio), 0.90) + 1)
-    return int(np.clip(k, 8, 12))
+def choose_k(var_ratio, k_or_var):
+    """An int is used as is; a float < 1 is the variance to capture."""
+    if isinstance(k_or_var, (int, np.integer)):
+        return int(k_or_var)
+    return int(np.searchsorted(np.cumsum(var_ratio), float(k_or_var)) + 1)
 
 
 def pca_transform(X, p, k, chunk=500_000):
@@ -489,3 +526,22 @@ def leave_one_well_out(bmu_zone, wells, zone_index, n_fac, shape, radius=1):
                               acc_winner=float(np.mean(pw == tf)), acc_prob=float(np.mean(pp == tf)))
     scores = {m: score(np.concatenate(a), np.concatenate(b), n_fac) for m, (a, b) in pooled.items()}
     return scores, per_well
+
+
+# =====================================================================================
+# Output volumes
+# =====================================================================================
+def write_zone_volume(path, template_segy, mask, zone_values, fill=0.0, iline_byte=189, xline_byte=193):
+    """Write zone-sample values as a SEG-Y with the template's geometry and trace headers (`fill` outside zone)."""
+    import segyio
+    with segyio.open(str(template_segy), iline=iline_byte, xline=xline_byte) as src:
+        vol = np.full((len(src.ilines), len(src.xlines), len(src.samples)), fill, np.float32)
+        vol[mask] = zone_values
+        spec = segyio.tools.metadata(src)
+        with segyio.create(str(path), spec) as dst:
+            dst.text[0] = src.text[0]
+            dst.bin = src.bin
+            dst.header = src.header
+            for i, il in enumerate(src.ilines):
+                dst.iline[il] = vol[i]
+    return Path(path)

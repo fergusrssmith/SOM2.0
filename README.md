@@ -9,10 +9,11 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
 | | SOM1.0 (multi-attribute) | SOM2.0 (embedding) |
 |---|---|---|
 | Features | ~36 single-trace instantaneous + banded attributes | 768-channel embedding from the [NCS seismic foundation model](https://github.com/NorskRegnesentral/NCS_models) |
-| Reduction | PCA used to select the dominant 8–12 attributes | PCA to *k* components |
-| Classification | 8 × 8 SOM | identical |
+| Input selection | distinct attributes (no pair with \|r\| ≥ 0.8), added by PCA influence until they reconstruct 90 % of all-attribute variance | PCs of the (2.5D) embedding capturing ~70 % of its variance |
+| Classification | 8 × 8 SOM (Kohonen map, with component planes) | identical |
 | Calibration | wells: biggest winner, or probabilistic | identical |
 | Scoring | leave-one-well-out | identical |
+| Output | facies, confidence and P(oil sand) SEG-Y volumes | identical |
 
 ## Files
 
@@ -20,11 +21,12 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
   *How to read it* note.
 - [`som2.py`](som2.py): the functions the notebook uses:
   - SEG-Y, horizon and LAS input, and the well tie
-  - SOM1.0 attributes and PCA selection
+  - SOM1.0 attributes and distinct, variance-targeted input selection
   - NCS feature loading and registration
   - PCA, batch SOM, calibration and leave-one-well-out scoring
+  - SEG-Y volume export
 - [`som2_plots.py`](som2_plots.py): the QC and explanation plots: base map, sections along a line through the
-  wells, horizon slices, SOM hit maps and U-matrices, node calibration views, and confusion matrices.
+  wells, horizon slices, SOM hit maps, U-matrices and component planes, node calibration views, and confusion matrices.
 - [`tools/make_workflow_notebook.py`](tools/make_workflow_notebook.py): regenerates the notebook.
 - [`requirements.txt`](requirements.txt): Python packages.
 
