@@ -60,6 +60,8 @@ SOM_SHAPE = (8, 8)               # neurons, on a hexagonal map (6 neighbours eac
 MAP_HORIZON = DATA / "Horizons" / "REST.txt"                      # top reservoir: maps are extracted along it ...
 MAP_OFFSET_MS = 8                # ... this far below it (the pick is not perfect)
 MAP_WINDOW_MS = 20               # P(oil sand) maps average this window below the horizon
+SECTIONS = [("inline", 12362), ("crossline", 1553)]   # straight sections for the well-match figures
+WELL_PROJECTION_TRACES = 35      # wells within this many traces of a section are projected onto it
 ATTR_R_MAX = 0.8                 # SOM1.0: no two selected attributes correlated |r| >= this
 ATTR_VAR_TARGET = 0.90           # SOM1.0: add distinct attributes until they reconstruct this share of all-attribute variance
 NCS_PC_VAR = 0.70                # SOM2.0: embedding variance captured by the PCs fed to the SOM
@@ -293,6 +295,17 @@ The 2D model processes sections independently. To create the embedding for a new
 ```python
 som2.run_ncs(SEISMIC, "features.zarr", model="NorskRegnesentralSTI/NCS-v1-2.5d-base", densify=4)   # GPU recommended
 ```
+
+**Normalisation.** Two steps, both standard for this model:
+- **Input seismic:** before inference, the NCS pipeline scales the cube to unit variance and clips amplitudes
+  beyond ±3 standard deviations (inference defaults `normalization_mode="std"`, `clip_sigma=3`). That is the same
+  normalisation the model's pre-training data received, so absolute amplitude levels don't matter.
+- **Embedding:** each of the 768 channels is z-scored (mean 0, standard deviation 1, over the whole feature cube)
+  before PCA, as in the NCS paper's own evaluations. No channel dominates just because of its scale.
+
+The NCS models were pre-trained on **full-stack** cubes. Here they're applied to a **mid-angle stack** (AVO18). After
+the normalisation above, the main differences are relative amplitudes between interfaces (the AVO response at that
+angle range) and somewhat lower signal-to-noise, both well within the variability of the 829 training cubes.
 
 **Registration:** the store's `inline/xline/time_depth` coordinates are 0-based sample indices of the input
 volume, at the patch start + `patch_size // 2`. The true patch centre is therefore half a sample earlier. The
@@ -565,6 +578,58 @@ probability averaged over the top of the reservoir. Look for coherent bodies wit
 rather than salt-and-pepper noise.
 """)
 
+
+md(r"""
+### Sections through the wells
+Straight sections chosen to pass through (or close to) the wells. Every well within `WELL_PROJECTION_TRACES` of the
+section is projected onto it, and its facies log is drawn as an outlined column, labelled with how far it was
+projected. A well far from the line can legitimately disagree with the section.
+""")
+code(r"""
+def straight_section(kind, number):
+    if kind == "inline":
+        i = int(np.searchsorted(ilines, number))
+        pth = np.c_[np.full(len(xlines), i), np.arange(len(xlines))]
+        axis_vals, label = xlines, "crossline"
+    else:
+        x = int(np.searchsorted(xlines, number))
+        pth = np.c_[np.arange(len(ilines)), np.full(len(ilines), x)]
+        axis_vals, label = ilines, "inline"
+    near = {}
+    for n, w in wells.items():
+        d = abs(w[0][0] - pth[0, 0]) if kind == "inline" else abs(w[1][0] - pth[0, 1])
+        if d <= WELL_PROJECTION_TRACES:
+            near[n] = (int(w[1][0] if kind == "inline" else w[0][0]), int(d))
+    return pth, near, axis_vals, label
+
+for kind, number in SECTIONS:
+    pth, near, axis_vals, label = straight_section(kind, number)
+    s0 = int(np.searchsorted(twt, top[pth[:, 0], pth[:, 1]].min() - 40))
+    s1 = int(np.searchsorted(twt, base[pth[:, 0], pth[:, 1]].max() + 40))
+    rng_t = (twt[s0], twt[s1 - 1])
+    pos = {f"{n} ({d} tr)": p for n, (p, d) in near.items()}
+    wl = {f"{n} ({d} tr)": wells[n] for n, (p, d) in near.items()}
+    fig, ax = plt.subplots(3, 1, figsize=(15, 11), sharex=True)
+    sp.seismic_line(ax[0], cube, pth, twt, s0, s1)
+    ax[0].set_title(f"{kind} {number}: seismic", loc="left", fontsize=10)
+    for a_, (name, b) in zip(ax[1:], [("SOM1.0", b1), (NAME2, b2)]):
+        sp.seismic_line(a_, cube, pth, twt, s0, s1)
+        f = calib[name][b].argmax(1).astype(float)
+        sp.overlay(a_, sp.zone_to_line(f, zone_index, pth, s0, s1), pth, twt, s0, s1, fac_cmap, -0.5, n_fac - 0.5, 0.85)
+        a_.set_title(f"{kind} {number}: {name} most likely facies (all wells used for calibration)", loc="left", fontsize=10)
+    for a_ in ax:
+        sp.decorate_line(a_, rng_t, pos, top, base, pth, label=(a_ is ax[0]))
+        sp.well_strips(a_, wl, pos, twt, fac_cmap, width=6, dt=dt_ms)
+    tick = np.linspace(0, len(pth) - 1, 9).astype(int)
+    ax[-1].set_xticks(tick, axis_vals[tick]); ax[-1].set_xlabel(label)
+    sp.facies_legend(fig, fac_names, fac_cmap); plt.tight_layout(rect=(0, 0.03, 1, 1)); plt.show()
+""")
+md(r"""
+*How to read it:* the same section three times: seismic, then the SOM1.0 and SOM2.0 facies calibrated with all
+wells. Outlined columns are the well facies logs, projected onto the section. The number of traces each was moved
+is in its label. Judge the match by the stacking of units, especially the oil sand (green) against brine sand
+(yellow), rather than bed by bed: thin beds are below seismic resolution.
+""")
 
 md(r"""
 ## 10 · Facies volumes

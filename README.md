@@ -18,7 +18,8 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
 ## Files
 
 - [`som2_workflow.ipynb`](som2_workflow.ipynb): the workflow, step by step. Each step has QC plots and a short
-  *How to read it* note.
+  *How to read it* note. The committed copy is executed, so the figures from the public example dataset are
+  visible on GitHub. `tools/make_workflow_notebook.py` regenerates a clean, unexecuted copy.
 - [`som2.py`](som2.py): the functions the notebook uses:
   - SEG-Y, horizon and LAS input, and the well tie
   - SOM1.0 attributes and distinct, variance-targeted input selection
