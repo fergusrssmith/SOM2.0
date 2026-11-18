@@ -8,8 +8,8 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
 
 | | SOM1.0 (multi-attribute) | SOM2.0 (embedding) |
 |---|---|---|
-| Features | ~36 single-trace instantaneous + banded attributes | 768-channel embedding from the [NCS seismic foundation model](https://github.com/NorskRegnesentral/NCS_models) |
-| Input selection | distinct attributes (no pair with \|r\| ≥ 0.8), added by PCA influence until they reconstruct 90 % of all-attribute variance | PCs of the (2.5D) embedding capturing ~70 % of its variance |
+| Features | ~33 attributes in 7 families (instantaneous, amplitude, spectral, similarity, dip, curvature, texture) | 768-channel embedding from the [NCS seismic foundation model](https://github.com/NorskRegnesentral/NCS_models) |
+| Input selection | continuity screen (neighbour-trace r ≥ 0.8), then distinct attributes (no pair with \|r\| ≥ 0.8) added by PCA influence until they reconstruct 90 % of all-attribute variance; z-scored | PCs of the 2.5D embedding (crop overlap 12) capturing ~70 % of its variance, whitened (unit variance per PC) |
 | Classification | 8 × 8 SOM (Kohonen map, with component planes) | identical |
 | Calibration | wells: biggest winner, or probabilistic | identical |
 | Scoring | leave-one-well-out | identical |
@@ -22,7 +22,7 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
   visible on GitHub. `tools/make_workflow_notebook.py` regenerates a clean, unexecuted copy.
 - [`som2.py`](som2.py): the functions the notebook uses:
   - SEG-Y, horizon and LAS input, and the well tie
-  - SOM1.0 attributes and distinct, variance-targeted input selection
+  - SOM1.0 attribute library, continuity screen and distinct, variance-targeted input selection
   - NCS feature loading and registration
   - PCA, batch SOM, calibration and leave-one-well-out scoring
   - SEG-Y volume export

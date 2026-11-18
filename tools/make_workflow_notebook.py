@@ -22,8 +22,8 @@ zone, self-organising map (SOM) and well calibration. **Only the features fed to
 
 | | **SOM1.0** (multi-attribute) | **SOM2.0** (embedding) |
 |---|---|---|
-| Input features | ~36 single-trace instantaneous + banded attributes computed from the seismic | 768-channel embedding from the NCS seismic foundation model ([NorskRegnesentral/NCS_models](https://github.com/NorskRegnesentral/NCS_models)) |
-| Input selection | PCA-guided choice of **distinct** attributes (no two with \|r\| ≥ 0.8), added until they reconstruct 90 % of the variance of all attributes; the SOM runs on the attribute values | PCs of the 2.5D embedding capturing 70 % of its variance (PCs are uncorrelated, so nothing is double counted) |
+| Input features | ~33 attributes in 7 families (instantaneous, amplitude, spectral, similarity, dip, curvature, texture), computed from the seismic | 768-channel embedding from the NCS seismic foundation model ([NorskRegnesentral/NCS_models](https://github.com/NorskRegnesentral/NCS_models)) |
+| Input selection | noisy attributes screened out by trace-to-trace continuity, then a PCA-guided choice of **distinct** attributes (no two with \|r\| ≥ 0.8) until they reconstruct 90 % of all-attribute variance; z-scored attribute values go to the SOM | PCs of the 2.5D embedding capturing 70 % of its variance, **whitened** (each PC scaled to unit variance, the analogue of z-scoring attributes) |
 | Classification | 8 × 8 SOM (Kohonen map), batch algorithm | identical |
 | Calibration | SOM nodes → well facies: biggest winner, and probabilistic (neighbour-smoothed) | identical |
 | Scoring | leave-one-well-out at the well trace | identical |
@@ -44,7 +44,8 @@ from pathlib import Path
 
 DATA = Path(r"C:\Data\Test")                                    # local data root (nothing is uploaded)
 SEISMIC = DATA / "SEGY" / "1988_AVO18.sgy"                       # base seismic volume used by both workflows
-NCS_FEATURES = DATA / "SEGY" / "1988_AVO18_ncs_25d_dir0_dens4"         # NCS 2.5D embedding of the same volume (densify 4)
+NCS_FEATURES = DATA / "SEGY" / "1988_AVO18_ncs_25d_dir0_dens4_ov12.zarr-20261118T115803Z-1-001" / "1988_AVO18_ncs_25d_dir0_dens4_ov12.zarr"
+                                 # NCS 2.5D embedding of the same volume (densify 4, crop overlap 12); a .zip works too
 LAS_DIR = DATA / "LAS" / "MORE"                                  # well facies logs in TWT (one LAS per well)
 PLOT_WELLS = ["App. 4", "Echo 1", "Echo 3", "Echo 2"]             # wells drawn on the strike line and maps
 VERTICAL_WELLS = ["Echo 1", "Echo 2", "Echo 3", "App. 3", "App. 4"]  # only vertical wells are used: the tie places each
@@ -63,9 +64,11 @@ MAP_OFFSET_MS = 8                # ... this far below it (the pick is not perfec
 MAP_WINDOW_MS = 20               # P(oil sand) maps average this window below the horizon
 SECTIONS = [("inline", 12362), ("crossline", 1553)]   # straight sections for the well-match figures
 WELL_PROJECTION_TRACES = 35      # wells within this many traces of a section are projected onto it
+ATTR_CONTINUITY_MIN = 0.8        # SOM1.0: drop attributes whose neighbour-trace correlation is below this
 ATTR_R_MAX = 0.8                 # SOM1.0: no two selected attributes correlated |r| >= this
 ATTR_VAR_TARGET = 0.90           # SOM1.0: add distinct attributes until they reconstruct this share of all-attribute variance
 NCS_PC_VAR = 0.70                # SOM2.0: embedding variance captured by the PCs fed to the SOM
+NCS_WHITEN = True                # SOM2.0: scale each PC to unit variance (equal weight, like z-scored attributes)
 OUTPUT_DIR = DATA / "SEGY" / "som_outputs"                        # facies / confidence / P(oil sand) volumes
 CAL_RADIUS = 1                   # calibration uses the (2r+1)^2 traces around each well; scoring uses the well trace
 SEED = 0
@@ -206,9 +209,23 @@ samples each well contributes per facies. Small counts mean noisy per-facies sco
 # =====================================================================================================
 md(r"""
 ## 4 · SOM1.0: multi-attribute workflow
-The attributes are single-trace instantaneous attributes (envelope, phase, frequency, sweetness, thin bed,
-bandwidth, Q, attenuation, relative acoustic impedance and others) and *banded* attributes (averages between
-phase breaks or envelope breaks), all computed from the single base volume.
+A family-balanced library of the attributes commonly used in multi-attribute SOM studies, all computed from the
+single base volume:
+- **Instantaneous:** amplitude, quadrature, envelope, normalised amplitude, phase, envelope-weighted frequency,
+  thin bed, Q, attenuation, bandwidth, envelope slope and second derivative.
+- **Amplitude:** RMS, average energy, sweetness, relative acoustic impedance.
+- **Spectral decomposition:** 15–60 Hz band magnitudes, peak frequency, peak magnitude.
+- **Similarity:** coherence, coherent energy, Sobel.
+- **Dip:** dip magnitude.
+- **Curvature:** most positive, most negative, curvedness.
+- **Texture:** GLCM-style entropy, contrast, homogeneity.
+
+Banded attributes (averages between phase or envelope breaks picked trace by trace) are left out: they jump from
+trace to trace and add vertical striping.
+
+**Continuity screen first.** Each attribute is scored by how well it correlates with itself one trace away. Spiky
+attributes (typically instantaneous Q and thin bed) fall below the threshold and are removed. Otherwise the
+selection below would favour them, because noise is uncorrelated with everything.
 
 **Selecting the SOM inputs without double counting.** Walk the principal components in order. From each, take the
 attribute with the highest loading, unless it correlates |r| ≥ 0.8 with an attribute already chosen. Stop when the
@@ -218,16 +235,30 @@ The SOM then runs on the selected attribute values, not on PC scores.
 """)
 code(r"""
 with som2.timer("SOM1.0 attributes"):
-    attr_names, X = som2.som1_attributes(cube, dt_ms, mask)
+    lib_names, lib_fam, X = som2.som1_library(cube, dt_ms, mask)
+continuity = som2.continuity_score(X, mask)
+keep_attr = [i for i in range(len(lib_names)) if continuity[i] >= ATTR_CONTINUITY_MIN]
+print("screened out (continuity):", [(lib_names[i], round(float(continuity[i]), 2)) for i in range(len(lib_names)) if i not in keep_attr])
+X = X[:, keep_attr]
+attr_names = [lib_names[i] for i in keep_attr]
+attr_fam = [lib_fam[i] for i in keep_attr]
 pca1 = som2.pca_fit(X)
 sel_idx, sel_names, sel_r2 = som2.select_distinct(X, attr_names, ATTR_R_MAX, ATTR_VAR_TARGET, seed=SEED)
 Z1 = ((X[:, sel_idx] - X[:, sel_idx].mean(0)) / (X[:, sel_idx].std(0) + 1e-9)).astype(np.float32)
 pc1_rgb = sp.rgb_from_scores(som2.pca_transform(X, pca1, 3))          # for the colour-blend QC below
-print(f"{len(attr_names)} attributes computed; {len(sel_idx)} distinct attributes reconstruct {sel_r2[-1]:.0%} of their variance:")
+print(f"{len(lib_names)} attributes computed, {len(attr_names)} pass the screen; {len(sel_idx)} distinct attributes reconstruct {sel_r2[-1]:.0%} of their variance:")
 print(sel_names)
 """)
 md("### QC: how the attributes are picked")
 code(r"""
+fam_cols = dict(zip(som2.SOM1_FAMILIES, plt.cm.tab10.colors))
+o = np.argsort(continuity)
+fig, ax = plt.subplots(figsize=(9, 7))
+ax.barh(range(len(o)), continuity[o], color=[fam_cols[lib_fam[i]] if continuity[i] >= ATTR_CONTINUITY_MIN else "lightgrey" for i in o])
+ax.set_yticks(range(len(o)), [lib_names[i] for i in o], fontsize=7); ax.axvline(ATTR_CONTINUITY_MIN, color="k", ls="--", lw=1)
+ax.set(xlim=(0, 1), title="Continuity screen: neighbour-trace correlation (grey = screened out)")
+ax.legend([plt.Rectangle((0, 0), 1, 1, color=c) for c in fam_cols.values()], list(fam_cols), fontsize=8, loc="lower right")
+plt.tight_layout(); plt.show()
 fig, ax = plt.subplots(1, 3, figsize=(18, 8), gridspec_kw={"width_ratios": [1.1, 1, 1]})
 L = np.abs(pca1["comps"][:6]).T
 im = ax[0].imshow(L, cmap="Greys", aspect="auto"); plt.colorbar(im, ax=ax[0], fraction=0.04, label="|loading|")
@@ -244,7 +275,8 @@ sp.selection_curve(ax[2], sel_names, sel_r2, ATTR_VAR_TARGET, "Variance of all a
 plt.tight_layout(); plt.show()
 """)
 md(r"""
-*How to read it:* left, each row is an attribute and each column a principal component. Dark means the attribute
+*How to read it:* first, every library attribute's continuity, coloured by family; grey ones are removed before
+selection. Then, left, each row is an attribute and each column a principal component. Dark means the attribute
 drives that component. The red attributes are the ones PCA selection keeps. Middle, how strongly the selected
 attributes correlate with each other. With the distinct rule, no off-diagonal cell reaches ±0.8, so no
 attribute is counted twice. Right, how much of the variance of all attributes the selection reconstructs as each
@@ -259,16 +291,14 @@ for ax, i in zip(axes, show):
     lo, hi = np.nanpercentile(img, [2, 98])
     ax.set_facecolor("0.85")
     sp.overlay(ax, img, path, twt, t0, t1, "turbo", lo, hi, alpha=1.0)
-    sp.decorate_line(ax, trange, well_pos, top, base, path, label=(i == show[0])); ax.set_title(attr_names[i], fontsize=9, loc="left")
+    sp.decorate_line(ax, trange, well_pos, top, base, path, label=(i == show[0])); ax.set_title(f"{attr_names[i]}  ({attr_fam[i]})", fontsize=9, loc="left")
 plt.tight_layout(); plt.show()
 del X
 """)
 md(r"""
-*How to read it:* the first six attributes that go into the SOM, shown on their own (no seismic underneath)
-inside the zone, along the strike line through the wells. Vertical striping comes from single-trace attributes:
-*banded* attributes average between phase or envelope breaks picked trace by trace, and Q, attenuation,
-acceleration of phase and thin bed spike where the envelope is near zero. It is not an edge effect: attributes
-are computed on the whole trace and only then sampled in the zone.
+*How to read it:* the first six attributes that go into the SOM, with their family, shown on their own (no
+seismic underneath) inside the zone, along the strike line through the wells. Attributes are computed on the whole
+trace and only then sampled in the zone, so there are no edge effects at the horizons.
 """)
 code(r"""
 with som2.timer("SOM1.0 SOM"):
@@ -295,7 +325,8 @@ crossline and the two diagonals) and combines them, so each vector also reflects
 The 2D model processes sections independently. To create the embedding for a new volume:
 
 ```python
-som2.run_ncs(SEISMIC, "features.zarr", model="NorskRegnesentralSTI/NCS-v1-2.5d-base", densify=4)   # GPU recommended
+som2.run_ncs(SEISMIC, "features.zarr", model="NorskRegnesentralSTI/NCS-v1-2.5d-base", densify=4,
+             num_overlap_patches=12)   # GPU recommended: ~3 minutes for this volume on a Colab GPU
 ```
 
 **Normalisation.** Two steps, both standard for this model:
@@ -317,6 +348,16 @@ features are interpolated from that grid onto the seismic samples of the zone.
 is spread across combinations of channels. So the SOM gets principal components, which are uncorrelated by
 construction (no double counting). The embedding spreads its variance widely: 8 PCs capture under 20%, 70% needs
 roughly 90 PCs, and 90% needs over 200. We use the PCs that capture 70%.
+
+**Whitening.** PC scores have very different variances: PC1 is large, PC80 tiny. Fed to the SOM as they are,
+the first few PCs dominate every distance and the rest barely count. Scaling each PC to unit variance gives them
+equal weight. That's the same treatment SOM1.0's attributes get from z-scoring, so the comparison is fair. In
+tests, whitening was the single biggest improvement to SOM2.0.
+
+**Crop overlap.** Inference tiles the volume into overlapping 224 × 224 crops. With the default overlap (a crop
+every 112 traces), some channels encode position within the crop and repeat with that spacing. Overlap 12 (a
+crop every 32 traces) blends each point from about 7 crops, which averages this out. The tiling check below
+measures what remains.
 """)
 code(r"""
 ds = som2.open_ncs(NCS_FEATURES)
@@ -338,11 +379,13 @@ print(f"embedding grid {dict(F.sizes)}; reference point: {ref_w} at {twt[ref_t +
 code(r"""
 with som2.timer("SOM2.0"):
     pca2, k2, Z2 = som2.ncs_pcs_on_zone(ds, mask, ilines, xlines, twt, NCS_PC_VAR)
+    if NCS_WHITEN:
+        Z2 = Z2 / (Z2.std(0) + 1e-9)
     W2, snaps2 = som2.train_som(Z2, SOM_SHAPE, seed=SEED)
     b2 = som2.bmu(Z2, W2)
 rgb2 = sp.rgb_from_scores(Z2)
 NAME2 = f"SOM2.0 ({k2} PCs)"
-print(f"SOM2.0 input: {k2} PCs = {pca2['var_ratio'][:k2].sum():.0%} of embedding variance")
+print(f"SOM2.0 input: {k2} PCs = {pca2['var_ratio'][:k2].sum():.0%} of embedding variance, {'whitened' if NCS_WHITEN else 'raw scores'}")
 fig = sp.component_planes(W2, [f"PC{i + 1}" for i in range(k2)], SOM_SHAPE,
                           f"SOM2.0 Kohonen map: component planes of the first 24 of {k2} embedding PCs (red = high)")
 plt.show()
@@ -712,8 +755,10 @@ md(r"""
 - **Thin beds.** Facies thinner than a few milliseconds (tuff, carbonaceous) are below seismic resolution for both
   workflows.
 - **NCS model.** Each embedding vector summarises a 16 × 16-sample patch, so detail finer than about 64 ms vertically
-  comes only from where the patches are placed. The 2.5D model is used here; the 2D model processes sections
-  independently and can leave tiling seams.
+  comes only from where the patches are placed. The 2.5D model is used here, with crop overlap 12 to suppress the
+  tile-position artefact.
+- **Base volume.** On this data both workflows scored better on the raw mid stack than on a structure-oriented
+  filtered version. The smoothing removes texture the sample-level attributes rely on.
 - **Alternatives tested.** Selecting raw embedding channels the SOM1.0 way, and SOM inputs built from cosine
   similarity (to unsupervised k-means centres, or to facies prototypes from the calibration wells), scored below
   embedding PCs. A k-nearest-neighbour classifier on the same PCs scored only slightly above the SOM, so with few

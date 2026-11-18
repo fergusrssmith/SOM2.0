@@ -281,28 +281,234 @@ def select_distinct(X, names, r_max=0.8, var_target=0.9, max_n=None, n_sample=20
 
 
 # =====================================================================================
+# SOM1.0 attribute library by family (instantaneous, amplitude, spectral, similarity, dip, curvature, texture),
+# continuity screen, and eigenvector-contribution selection
+# =====================================================================================
+SOM1_FAMILIES = {
+    "instantaneous": ["amplitude", "quadrature", "envelope", "normalized_amplitude", "inst_phase_sin",
+                      "inst_frequency_weighted", "thin_bed", "inst_q", "attenuation", "bandwidth",
+                      "envelope_slope", "envelope_2nd_derivative"],
+    "amplitude": ["rms_amplitude", "average_energy", "sweetness", "relative_acoustic_impedance"],
+    "spectral": ["spec_15Hz", "spec_25Hz", "spec_35Hz", "spec_45Hz", "spec_60Hz", "peak_frequency", "peak_magnitude"],
+    "similarity": ["coherence", "coherent_energy", "sobel_similarity"],
+    "dip": ["dip_magnitude"],
+    "curvature": ["curvature_most_positive", "curvature_most_negative", "curvedness"],
+    "texture": ["glcm_entropy", "glcm_contrast", "glcm_homogeneity"],
+}
+
+
+def som1_library_names():
+    names, fam = [], []
+    for f, ns in SOM1_FAMILIES.items():
+        names += ns
+        fam += [f] * len(ns)
+    return names, fam
+
+
+def som1_library(cube, dt_ms, mask, rms_ms=20.0, energy_ms=44.0, smooth_ms=20.0, spec_freqs=(15, 25, 35, 45, 60),
+                 sim_traces=3, sim_ms=24.0, tex_traces=5, tex_ms=36.0):
+    """~33 smooth, mostly multi-trace attributes from one seismic volume, grouped by family (no banded attributes).
+    Windows are in milliseconds and traces. Returns (names, families, X) with X = (zone samples, attributes)."""
+    names, fam = som1_library_names()
+    X = np.empty((int(mask.sum()), len(names)), np.float32)
+    col = iter(range(len(names)))
+    n = lambda ms: max(1, int(round(ms / dt_ms))) | 1  # noqa: E731
+
+    def put(a):
+        X[:, next(col)] = np.nan_to_num(np.asarray(a, np.float32)[mask], posinf=0, neginf=0)
+
+    a = cube.astype(np.float32) / (np.std(cube[mask]) + 1e-9)
+    dt_s = dt_ms / 1000
+    an = signal.hilbert(a, axis=-1)
+    env = np.abs(an).astype(np.float32)
+    ph = np.angle(an).astype(np.float32)
+    freq = np.gradient(np.unwrap(ph, axis=-1), dt_s, axis=-1) / (2 * np.pi)
+    # envelope-weighted (smoothed) instantaneous frequency: stable where the envelope is small
+    wfreq = ndimage.uniform_filter1d(env * freq, n(smooth_ms), axis=-1) / (ndimage.uniform_filter1d(env, n(smooth_ms), axis=-1) + 1e-6)
+    sfreq = ndimage.uniform_filter1d(wfreq, n(smooth_ms), axis=-1)
+    de = np.gradient(env, dt_s, axis=-1)
+    clip = lambda q: np.clip(q, *np.percentile(q[mask], [1, 99]))  # noqa: E731
+    put(a); put(an.imag); put(env); put(np.cos(ph)); put(np.sin(ph)); put(wfreq)
+    put(freq - sfreq)                                                                   # thin bed
+    put(clip(np.pi * np.maximum(np.abs(wfreq), 1.0) * env / np.where(np.abs(de) < 1e-6, 1e-6, -de)))   # inst Q
+    put(clip(np.abs(de) / (env + 1e-6)))                                                # attenuation (decay rate)
+    put(clip(np.abs(de) / (2 * np.pi * (env + 1e-6))))                                  # bandwidth
+    put(de); put(np.gradient(de, dt_s, axis=-1))
+    del an, de
+
+    put(np.sqrt(ndimage.uniform_filter1d(a * a, n(rms_ms), axis=-1)))
+    put(ndimage.uniform_filter1d(env ** 2, n(energy_ms), axis=-1))
+    put(env / np.sqrt(np.maximum(np.abs(wfreq), 1.0)))                                  # sweetness (Radovich & Oliveros)
+    rai = np.cumsum(a - a.mean(-1, keepdims=True), axis=-1)
+    put(ndimage.uniform_filter1d(rai - ndimage.uniform_filter1d(rai, max(3, int(100 / dt_ms)), axis=-1), 3, axis=-1))
+    del rai, ph, freq, sfreq, wfreq
+
+    # spectral decomposition: Gaussian band-pass envelopes, then peak frequency / magnitude over a finer bank
+    nt = a.shape[-1]
+    f = np.fft.rfftfreq(nt, dt_s)
+    A = np.fft.rfft(a, axis=-1)
+
+    def band(f0):
+        g = np.exp(-0.5 * ((f - f0) / (0.4 * f0)) ** 2)
+        return np.abs(signal.hilbert(np.fft.irfft(A * g, n=nt, axis=-1), axis=-1)).astype(np.float32)
+
+    for f0 in spec_freqs:
+        put(band(f0))
+    bank = np.arange(10, min(80, 0.8 * 500 / dt_ms) + 1, 5)
+    pk_mag = np.zeros_like(a)
+    pk_f = np.zeros_like(a)
+    for f0 in bank:
+        b = band(f0)
+        better = b > pk_mag
+        pk_mag[better], pk_f[better] = b[better], f0
+    put(ndimage.uniform_filter1d(pk_f, n(smooth_ms), axis=-1)); put(pk_mag)
+    del A, pk_mag, pk_f
+
+    # similarity: semblance and coherent energy over (sim_traces x sim_traces) traces x sim_ms; Sobel edge measure
+    win = (sim_traces, sim_traces, n(sim_ms))
+    mean_tr = ndimage.uniform_filter(a, (sim_traces, sim_traces, 1))
+    num = ndimage.uniform_filter1d(mean_tr ** 2, win[2], axis=-1)
+    den = ndimage.uniform_filter(a * a, win) + 1e-9
+    put(num / den); put(num)
+    sob = np.hypot(ndimage.sobel(a, axis=0), ndimage.sobel(a, axis=1))
+    put(ndimage.uniform_filter(sob ** 2, win) / den)
+    del mean_tr, num, den, sob
+
+    # dip and curvature from the structure tensor (reflector normal -> time dips p, q -> their lateral derivatives)
+    gi = ndimage.gaussian_filter(a, 1.0, order=(1, 0, 0))
+    gx = ndimage.gaussian_filter(a, 1.0, order=(0, 1, 0))
+    gt = ndimage.gaussian_filter(a, 1.0, order=(0, 0, 1))
+    S = lambda q: ndimage.gaussian_filter(q, (2, 2, 3))  # noqa: E731
+    Tit, Txt, Ttt = S(gi * gt), S(gx * gt), S(gt * gt) + 1e-9
+    p, q = -Tit / Ttt, -Txt / Ttt                                                       # time dips (samples per trace)
+    del gi, gx, gt, Tit, Txt, Ttt
+    put(np.hypot(p, q))
+    ps, qs = ndimage.gaussian_filter(p, (2, 2, 1)), ndimage.gaussian_filter(q, (2, 2, 1))
+    a11, a22 = np.gradient(ps, axis=0), np.gradient(qs, axis=1)
+    a12 = 0.5 * (np.gradient(ps, axis=1) + np.gradient(qs, axis=0))
+    mean_k, rad = 0.5 * (a11 + a22), np.sqrt((0.5 * (a11 - a22)) ** 2 + a12 ** 2)
+    k1, k2 = mean_k + rad, mean_k - rad
+    put(k1); put(k2); put(np.sqrt(0.5 * (k1 ** 2 + k2 ** 2)))
+    del p, q, ps, qs, a11, a22, a12, mean_k, rad, k1, k2
+
+    # texture: grey-level statistics in (tex_traces x tex_traces x tex_ms) windows (GLCM-like)
+    tw = (tex_traces, tex_traces, n(tex_ms))
+    edges = np.quantile(a[mask], np.linspace(0, 1, 17)[1:-1])
+    lev = np.digitize(a, edges)
+    ent = np.zeros_like(a)
+    for k in range(16):
+        pk = ndimage.uniform_filter((lev == k).astype(np.float32), tw)
+        ent -= pk * np.log(pk + 1e-9)
+    put(ent)
+    dif = (np.diff(lev, axis=1, append=lev[:, -1:]) ** 2 + np.diff(lev, axis=0, append=lev[-1:]) ** 2).astype(np.float32)
+    put(ndimage.uniform_filter(dif, tw))
+    put(ndimage.uniform_filter(1.0 / (1.0 + np.sqrt(dif)), tw))
+    assert next(col, None) is None, "attribute count mismatch"
+    return names, fam, X
+
+
+def continuity_score(X, mask, max_pairs=400_000, seed=0):
+    """Per attribute: correlation between each zone sample and its neighbour one trace along the inline and along the
+    crossline (mean of both). Smooth, geological attributes score high; trace-to-trace noise scores low."""
+    rng = np.random.default_rng(seed)
+    zi = np.full(mask.shape, -1, np.int64)
+    zi[mask] = np.arange(int(mask.sum()))
+    ijt = np.argwhere(mask)
+    scores = np.zeros(X.shape[1])
+    for d in ((1, 0, 0), (0, 1, 0)):
+        nb = ijt + np.array(d)
+        ok = (nb[:, 0] < mask.shape[0]) & (nb[:, 1] < mask.shape[1])
+        a_idx = zi[tuple(ijt[ok].T)]
+        b_idx = zi[tuple(nb[ok].T)]
+        keep = b_idx >= 0
+        a_idx, b_idx = a_idx[keep], b_idx[keep]
+        s = rng.choice(len(a_idx), min(max_pairs, len(a_idx)), replace=False)
+        A, B = X[a_idx[s]].astype(np.float64), X[b_idx[s]].astype(np.float64)
+        A, B = (A - A.mean(0)) / (A.std(0) + 1e-12), (B - B.mean(0)) / (B.std(0) + 1e-12)
+        scores += (A * B).mean(0) / 2
+    return scores
+
+
+def select_by_contribution(X, names, var_target=0.7, max_pcs=4, contrib_target=0.7, max_per_pc=4, r_dup=0.95,
+                           n_sample=200_000, seed=0):
+    """Eigenvector-contribution selection (the usual multi-attribute PCA practice): for each leading eigenvector
+    (until `var_target` of the variance, at most `max_pcs`), rank attributes by their % contribution (squared
+    loading) and keep the top ones until they make up `contrib_target` of that eigenvector (at most `max_per_pc`).
+    Only near-identical duplicates (|r| >= r_dup with an attribute already chosen) are skipped.
+    Returns (indices, names, table) where table rows = (attribute, eigenvector, % of eigenvector, % of total)."""
+    rng = np.random.default_rng(seed)
+    S = X[rng.choice(len(X), min(n_sample, len(X)), replace=False)].astype(np.float64)
+    p = pca_fit(S, n_fit=len(S), seed=seed)
+    C = np.corrcoef(((S - S.mean(0)) / (S.std(0) + 1e-9)).T)
+    n_pc = int(min(max_pcs, np.searchsorted(np.cumsum(p["var_ratio"]), var_target) + 1))
+    chosen, table = [], []
+    for e in range(n_pc):
+        contrib = p["comps"][e] ** 2                                   # squared loadings sum to 1
+        order = np.argsort(-contrib)
+        got, cum = 0, 0.0
+        for i in order:
+            if cum >= contrib_target or got >= max_per_pc:
+                break
+            cum += contrib[i]
+            if i in chosen or (chosen and np.max(np.abs(C[i, chosen])) >= r_dup):
+                continue
+            chosen.append(int(i))
+            got += 1
+            table.append((names[i], e + 1, 100 * contrib[i], 100 * contrib[i] * p["var_ratio"][e]))
+    return chosen, [names[i] for i in chosen], table, p
+
+
+# =====================================================================================
 # SOM2.0: NCS seismic foundation-model embedding
 # =====================================================================================
-def run_ncs(seismic_path, out_zarr, model="NorskRegnesentralSTI/NCS-v1-2d-base", densify=4, batch_size=32,
-            dtype="float16", device=None):
-    """Run the NCS foundation model (github.com/NorskRegnesentral/NCS_models) on a SEG-Y -> Zarr feature store."""
+def run_ncs(seismic_path, out_zarr, model="NorskRegnesentralSTI/NCS-v1-2.5d-base", densify=4, batch_size=32,
+            dtype="float16", device=None, num_overlap_patches=12, clip_sigma=3.0, normalization_mode="std"):
+    """Run the NCS foundation model (github.com/NorskRegnesentral/NCS_models) on a SEG-Y -> Zarr feature store.
+    num_overlap_patches=12 (crops every 32 traces instead of the default 112) averages out the tile-position
+    artefact some channels carry; clip_sigma/normalization_mode are the pre-training normalisation."""
     from NCS.inference import run_inference
     return run_inference(model_path=model, input_path=str(seismic_path), output_path=str(out_zarr),
-                         densify=densify, batch_size=batch_size, device=device or DEVICE, dtype=dtype)
+                         densify=densify, batch_size=batch_size, device=device or DEVICE, dtype=dtype,
+                         num_overlap_patches=num_overlap_patches, overlap_filter="ramp", clip_sigma=clip_sigma,
+                         normalization_mode=normalization_mode)
 
 
-def open_ncs(zarr_path):
-    """Return the xarray Dataset holding `features` (handles the per-direction group)."""
+def open_ncs(zarr_path, check_complete=True):
+    """Return the xarray Dataset holding `features` (handles the per-direction group). Also reads a store straight
+    from a .zip (e.g. a Google Drive download) without extracting it. With `check_complete`, raises if chunks of
+    the feature array are missing (split or interrupted downloads)."""
+    import json
+    import math
     import xarray as xr
     import zarr
-    root = zarr.open(str(zarr_path), mode="r")
+    p = str(zarr_path)
+    if p.lower().endswith(".zip"):
+        import zipfile
+        from zarr.storage import ZipStore
+        with zipfile.ZipFile(p) as zf:
+            names = zf.namelist()
+            feat_meta = [n for n in names if n.endswith("/features/zarr.json")]
+            if not feat_meta:
+                raise KeyError("no 'features' array in " + p)
+            prefix = feat_meta[0][: -len("/features/zarr.json")]
+            if check_complete:
+                m = json.loads(zf.read(feat_meta[0]))
+                expected = math.prod(math.ceil(s / c) for s, c in
+                                     zip(m["shape"], m["chunk_grid"]["configuration"]["chunk_shape"]))
+                have = sum(1 for n in names if n.startswith(prefix + "/features/c/") and not n.endswith("/"))
+                if have < expected:
+                    raise IOError(f"{p}: only {have} of {expected} feature chunks - incomplete (split?) download")
+        ds = xr.open_zarr(ZipStore(p, mode="r"), group=prefix, consolidated=False)
+        print("NCS group (zip):", prefix, dict(ds["features"].sizes))
+        return ds
+    root = zarr.open(p, mode="r")
     groups = [g for g in getattr(root, "group_keys", lambda: [])()]
     for g in (groups or [None]):
-        ds = xr.open_zarr(str(zarr_path), group=g) if g else xr.open_zarr(str(zarr_path))
+        ds = xr.open_zarr(p, group=g) if g else xr.open_zarr(p)
         if "features" in ds:
             print("NCS group:", g, dict(ds["features"].sizes))
             return ds
-    raise KeyError("no 'features' variable found in " + str(zarr_path))
+    raise KeyError("no 'features' variable found in " + p)
 
 
 def _coord_to_index(coord, axis_values):
