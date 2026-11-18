@@ -473,6 +473,26 @@ def run_ncs(seismic_path, out_zarr, model="NorskRegnesentralSTI/NCS-v1-2.5d-base
                          normalization_mode=normalization_mode)
 
 
+def crop_step(num_overlap_patches=12, crop=224, patch=16):
+    """Spacing (in samples) between successive inference crops: the period of any tiling artefact."""
+    return crop - patch * num_overlap_patches
+
+
+def crop_step_share(V, coords, axis, period):
+    """Share of variance that repeats with the crop step along one axis, per trailing channel.
+    `V`: (inline, xline, time, channels) on the native feature grid; `coords`: that axis' sample coordinates.
+    A running mean exactly one period long removes geology smoother than the period but leaves a periodic pattern
+    intact (it averages to a constant over one period); the phase-averaged residual is the periodic part. Geology
+    that happens to vary on the same scale is not mistaken for tiling, unlike a raw phase average."""
+    step = int(coords[1] - coords[0])
+    w = max(int(period // step), 2)
+    V = V - V.mean((0, 1, 2))
+    R = V - ndimage.uniform_filter1d(V, size=w, axis=axis, mode="nearest")
+    ph = ((np.asarray(coords) - coords[0]) % period) // step
+    m = np.stack([np.take(R, np.where(ph == q)[0], axis=axis).mean((0, 1, 2)) for q in range(w)])
+    return (m ** 2).mean(0) / (V.var((0, 1, 2)) + 1e-12)
+
+
 def open_ncs(zarr_path, check_complete=True):
     """Return the xarray Dataset holding `features` (handles the per-direction group). Also reads a store straight
     from a .zip (e.g. a Google Drive download) without extracting it. With `check_complete`, raises if chunks of

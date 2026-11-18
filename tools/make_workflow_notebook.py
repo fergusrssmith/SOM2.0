@@ -71,7 +71,9 @@ NCS_PC_VAR = 0.70                # SOM2.0: embedding variance captured by the PC
 NCS_WHITEN = True                # SOM2.0: scale each PC to unit variance (equal weight, like z-scored attributes)
 OUTPUT_DIR = DATA / "SEGY" / "som_outputs"                        # facies / confidence / P(oil sand) volumes
 CAL_RADIUS = 1                   # calibration uses the (2r+1)^2 traces around each well; scoring uses the well trace
-SEED = 0
+SEED = 0                         # seed for the SOMs shown in the figures
+N_SEEDS = 5                      # blind scores are also reported over this many SOM seeds
+NCS_OVERLAP = 12                 # num_overlap_patches used for the embedding (sets the crop step checked below)
 """)
 code(r"""
 import sys
@@ -389,7 +391,6 @@ print(f"SOM2.0 input: {k2} PCs = {pca2['var_ratio'][:k2].sum():.0%} of embedding
 fig = sp.component_planes(W2, [f"PC{i + 1}" for i in range(k2)], SOM_SHAPE,
                           f"SOM2.0 Kohonen map: component planes of the first 24 of {k2} embedding PCs (red = high)")
 plt.show()
-del Z2
 """)
 md(r"""
 *How to read it:* the same Kohonen component-plane view for SOM2.0, one map per embedding PC. The leading PCs
@@ -400,7 +401,7 @@ code(r"""
 fig, ax = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
 ch = E[..., 0].T
 sp.overlay(ax[0], ch, path, twt, t0, t1, "viridis", *np.percentile(ch, [2, 98]), alpha=1.0)
-ax[0].set_title("Embedding channel 0 on its own (no seismic): note the vertical bands, a tile-position artefact (see below)", loc="left", fontsize=9)
+ax[0].set_title("Embedding channel 0 on its own (no seismic)", loc="left", fontsize=9)
 sim = (En @ ref).T
 sp.seismic_line(ax[1], cube, path, twt, t0, t1)
 im = sp.overlay(ax[1], sim, path, twt, t0, t1, "RdYlBu_r", -0.2, 1.0, alpha=0.75)
@@ -416,7 +417,8 @@ ax[-1].set_xlabel("trace along line"); plt.tight_layout(); plt.show()
 """)
 md(r"""
 *How to read it:*
-- **Top:** embedding channel 0 on its own. Its vertical bands are not geology; see the tiling check below.
+- **Top:** embedding channel 0 on its own, interpolated to the seismic grid. With the default crop overlap this
+  channel showed vertical bands from the inference tiling; the tiling check below tests for them.
 - **Second:** pick one point (the star, in oil sand) and colour every location by how similar its embedding is.
   The model groups the reservoir interval laterally without being told anything about it.
 - **Bottom two:** the first three components of each workflow's features, shown as colours. Colour changes are
@@ -425,54 +427,79 @@ md(r"""
 """)
 
 md(r"""
-### QC: raw embedding channels and the tiling artefact
-Inference tiles the volume into overlapping 224 × 224 crops. A ViT token carries information about where it sits
-in its crop, so some channels repeat with the tile spacing. Below: 16 channels on the native feature grid with no
-seismic and no interpolation, as an inline section and as a time slice. Then, for every channel and the leading
-PCs, the share of variance explained purely by position within the tile along the crossline.
+### QC: raw embedding channels and the tiling check
+Inference tiles the volume into overlapping 224 × 224 crops, laid along the crossline and time axes (one crop per
+inline). A ViT token carries information about where it sits in its crop, and the 2.5D model takes its crossline and
+diagonal slices through the crop's centre trace. Any tiling artefact therefore repeats with the **crop step**
+(`224 − 16 × num_overlap_patches` samples: 112 at the default overlap 7, 32 at overlap 12).
+
+Below: 16 channels on the native feature grid with no seismic and no interpolation, as an inline section and as a
+time slice. Then the share of variance that repeats with the crop step, for every channel and every SOM2.0 input PC,
+along the crossline and time (tiled axes) and the inline (not tiled, so a control).
+
+**How the share is measured.** A running mean exactly one crop step long is subtracted first. It removes geology
+that varies more slowly than the step, but leaves a pattern that repeats with the step untouched. The average of
+what's left at each position within the step is the repeating part. Without that first step, slow geological
+trends (the depth trend along time especially) get counted as tiling. Planting a known periodic signal in these
+PCs recovers it to within about half a percentage point at 2%, 5% and 20%.
 """)
 code(r"""
 G = np.asarray(F.values, np.float32)                                   # native grid (inline, xline, time, 768)
-Gz = (G - G.mean((0, 1, 2))) / (G.std((0, 1, 2)) + 1e-9)
-xs = ds["xline"].values; step = int(xs[1] - xs[0])
-TILE = 224                                                             # crop width in traces (NCS default)
-phase = ((xs - xs[0]) % TILE) // step
-
-def tile_share(v):                                                     # variance share explained by tile phase
-    m = np.array([v[:, phase == q].mean() for q in np.unique(phase)]); c = np.array([(phase == q).sum() for q in np.unique(phase)])
-    return float((c * m ** 2).sum() / c.sum() / (v ** 2).mean())
-
-share_ch = np.array([tile_share(Gz[..., c]) for c in range(Gz.shape[-1])])
-show_ch = np.r_[0, np.random.default_rng(0).choice(np.arange(1, Gz.shape[-1]), 15, replace=False)]
+STEP = som2.crop_step(NCS_OVERLAP)                                     # crop step in samples (32 at overlap 12)
+AXES = {"crossline": (1, ds["xline"].values), "time": (2, ds["time_depth"].values), "inline (control)": (0, ds["inline"].values)}
+share_ch = np.concatenate([som2.crop_step_share(G[..., c:c + 128], ds["xline"].values, 1, STEP)
+                           for c in range(0, G.shape[-1], 128)])        # per channel, along the crossline
+show_ch = np.r_[0, np.random.default_rng(0).choice(np.arange(1, G.shape[-1]), 15, replace=False)]
 fi_line = int(np.argmin(np.abs(gi - path[len(path) // 2, 0])))
 kt = int(np.argmin(np.abs(twt[0] + gt * (twt[1] - twt[0]) - (np.median(top) + 60))))
 fig, axes = plt.subplots(4, 8, figsize=(22, 11))
 for j, c in enumerate(show_ch):
     a = axes.ravel()[j]; v = G[fi_line, :, :, c].T; lo, hi = np.percentile(v, [2, 98])
-    a.imshow(v, cmap="viridis", vmin=lo, vmax=hi, aspect="auto", interpolation="nearest"); a.set_title(f"ch {c} (tile {share_ch[c]:.0%})", fontsize=8)
+    a.imshow(v, cmap="viridis", vmin=lo, vmax=hi, aspect="auto", interpolation="nearest"); a.set_title(f"ch {c} (repeating {share_ch[c]:.1%})", fontsize=8)
     a = axes.ravel()[16 + j]; v = G[:, :, kt, c]; lo, hi = np.percentile(v, [2, 98])
     a.imshow(v, cmap="viridis", vmin=lo, vmax=hi, aspect="equal", interpolation="nearest"); a.set_title(f"ch {c} time slice", fontsize=8)
 for a in axes.ravel(): a.set_xticks([]); a.set_yticks([])
 fig.suptitle(f"Rows 1-2: inline {ilines[int(round(gi[fi_line]))]} sections; rows 3-4: time slice ~{twt[0] + gt[kt] * (twt[1] - twt[0]):.0f} ms (x = crossline). Native grid, no seismic.", fontsize=11)
 plt.tight_layout(); plt.show()
 
-Pz = (Gz.reshape(-1, Gz.shape[-1]) @ pca2["comps"][:k2].T).reshape(*Gz.shape[:3], k2)
-share_pc = np.array([tile_share((Pz[..., k] - Pz[..., k].mean()) / Pz[..., k].std()) for k in range(k2)])
-fig, ax = plt.subplots(1, 2, figsize=(15, 3.6))
-ax[0].hist(share_ch, bins=50, color="steelblue"); ax[0].set(title="Embedding channels: variance explained by tile position", xlabel="share of variance", ylabel="channels"); ax[0].set_yscale("log")
-ax[1].bar(range(1, k2 + 1), share_pc, color=["crimson" if v > 0.2 else "steelblue" for v in share_pc]); ax[1].axhline(0.2, color="k", ls="--", lw=1)
-ax[1].set(title=f"SOM2.0 input PCs: variance explained by tile position (red > 20%)", xlabel="PC", ylim=(0, 1))
+Pz = som2.pca_transform(G.reshape(-1, G.shape[-1]), pca2, k2).reshape(*G.shape[:3], k2)
+share_pc = {name: som2.crop_step_share(Pz, c, ax_i, STEP) for name, (ax_i, c) in AXES.items()}
+fig, ax = plt.subplots(1, 2, figsize=(16, 3.8), gridspec_kw={"width_ratios": [1, 2]})
+ax[0].hist(100 * share_ch, bins=50, color="steelblue"); ax[0].set_yscale("log")
+ax[0].set(title=f"768 embedding channels: share repeating every {STEP} traces (crossline)", xlabel="% of variance", ylabel="channels")
+for (name, v), col in zip(share_pc.items(), ["crimson", "darkorange", "grey"]):
+    ax[1].plot(range(1, k2 + 1), 100 * v, "o-", ms=3, lw=1, color=col, label=name)
+ax[1].axhline(10, color="k", ls="--", lw=1); ax[1].set_ylim(0, max(12, 100 * max(v.max() for v in share_pc.values()) + 2))
+ax[1].set(title=f"SOM2.0 input PCs: % of variance repeating with the {STEP}-sample crop step", xlabel="PC", ylabel="% of variance"); ax[1].legend(fontsize=8)
 plt.tight_layout(); plt.show()
-print(f"channels with >10% tile-position variance: {np.sum(share_ch > 0.1)} of {len(share_ch)}; PCs >20%: {list(np.where(share_pc > 0.2)[0] + 1)}")
-del G, Gz, Pz
+print(f"crop step {STEP} samples; channels repeating >5% along crossline: {int(np.sum(share_ch > 0.05))} of {len(share_ch)}")
+for name, v in share_pc.items():
+    print(f"  SOM2.0 PCs along {name:17s}: mean {v.mean():.1%}, max {v.max():.1%} (PC{int(v.argmax()) + 1})")
+del G, Pz
 """)
 md(r"""
-*How to read it:* most channels show geology (layering in section, channels and structure in the time slice). A
-minority show bands that repeat with the crop spacing along the crossline, the tile-position artefact. Channel 0
-is the clearest case. The bar chart shows how much of each SOM2.0 input PC follows tile position. PCs flagged in
-red feed the artefact into the SOM, which shows up as vertical boundaries in the neuron sections. Remedies: rerun
-inference with more crop overlap (`num_overlap_patches`) or average runs with shifted tile origins; or drop or
-regress out the affected PCs.
+*How to read it:* the channels show geology: layering in section, channels and structure in the time slice. The
+charts measure what repeats with the crop step. At overlap 12 it's around 1% of variance or less for the SOM2.0
+input PCs, on both tiled axes, the same level as the untiled inline control. Tiling no longer affects the SOM.
+
+**Volume-edge effect.** Channel 0 shows a frame rather than stripes. Crops near the crossline edges of the volume
+extend past it and are zero-padded, so some channels drift within about half a crop (~110 traces) of those edges.
+It isn't periodic, so the measure above doesn't count it. The calibration wells sit at or inside that margin.
+Facies predicted within ~110 traces of the crossline edges should be treated with caution. Running inference on a
+volume wider than the study area avoids it.
+
+At the default overlap 7 (a crop every 112 traces), some channels did carry visible vertical bands. Other runs on
+this volume gave no further gain:
+
+| Inference variant (all densify 4) | Repeating share, worst PC | Blind accuracy, SOM seed 0 |
+|---|---|---|
+| overlap 12, `ramp` blending (used here) | ~1% | 57% |
+| overlap 12, `center` blending (each patch from its nearest-centred crop) | ~9% | 57% |
+| overlap 13, `center` | ~2% | 50% |
+| crops laid along inlines (`direction="dir90"`), overlap 12 | ~2% | 45% |
+| dir0 and dir90 embeddings averaged | ~2% | 55% |
+
+Differences of a few points are within the seed-to-seed spread shown in section 8.
 """)
 code(r"""
 fig, ax = plt.subplots(1, 2, figsize=(13, 3.4))
@@ -585,6 +612,34 @@ for name, b in runs.items():
                      **{f"acc {w}": pw[w][f"acc_{m}"] for w in wells}})
 scores_df = pd.DataFrame(rows)
 display(scores_df.style.format(precision=2, subset=scores_df.columns[2:]).hide(axis="index"))
+""")
+md(r"""
+### How much do the scores depend on the SOM's random start?
+A SOM starts from random weights, so a different seed gives a slightly different map and slightly different scores.
+The figures use seed 0. Below, both workflows are retrained with several seeds and blind-scored each time.
+Differences between workflows smaller than this spread aren't meaningful.
+""")
+code(r"""
+seed_rows = []
+for name, Z in [("SOM1.0", Z1), (NAME2, Z2)]:
+    for sd in range(N_SEEDS):
+        W_s, _ = som2.train_som(Z, SOM_SHAPE, seed=sd)
+        sc, pw = som2.leave_one_well_out(som2.bmu(Z, W_s), wells, zone_index, n_fac, SOM_SHAPE, CAL_RADIUS)
+        seed_rows.append({"workflow": name, "seed": sd, "accuracy": sc["prob"]["accuracy"],
+                          "balanced accuracy": sc["prob"]["balanced_accuracy"],
+                          **{f"acc {w}": pw[w]["acc_prob"] for w in wells}})
+seeds_df = pd.DataFrame(seed_rows)
+summary = seeds_df.drop(columns="seed").groupby("workflow", sort=False).agg(["mean", "min", "max"])
+display(summary.style.format("{:.1%}").set_caption(f"Blind (leave-one-well-out) scores over {N_SEEDS} SOM seeds; majority class {majority:.1%}"))
+fig, ax = plt.subplots(figsize=(7, 3.2))
+for i, (name, g) in enumerate(seeds_df.groupby("workflow", sort=False)):
+    ax.scatter(g["accuracy"], np.full(len(g), i), s=40, label=name)
+    ax.plot([g["accuracy"].min(), g["accuracy"].max()], [i, i], color="grey", lw=1, zorder=0)
+ax.axvline(majority, color="k", ls="--", lw=1, label="majority class")
+ax.set_yticks(range(seeds_df["workflow"].nunique()), seeds_df["workflow"].unique()); ax.set_ylim(-0.6, 1.6)
+ax.set(xlabel="blind accuracy", title=f"Blind accuracy for {N_SEEDS} SOM seeds"); ax.legend(fontsize=8, loc="lower right")
+plt.tight_layout(); plt.show()
+del Z2                                                                 # ~3 GB; not needed after this
 """)
 code(r"""
 best2 = NAME2
@@ -755,8 +810,11 @@ md(r"""
 - **Thin beds.** Facies thinner than a few milliseconds (tuff, carbonaceous) are below seismic resolution for both
   workflows.
 - **NCS model.** Each embedding vector summarises a 16 × 16-sample patch, so detail finer than about 64 ms vertically
-  comes only from where the patches are placed. The 2.5D model is used here, with crop overlap 12 to suppress the
-  tile-position artefact.
+  comes only from where the patches are placed. The 2.5D model is used here, with crop overlap 12, which removes the
+  tile-position artefact (section 5 check). Within ~110 traces of the crossline edges of the volume, zero-padded
+  crops shift some channels; ideally run inference on a volume wider than the study area.
+- **SOM seeds.** Scores vary by a few points with the SOM's random start (section 8). Compare workflows on the
+  seed-averaged scores.
 - **Base volume.** On this data both workflows scored better on the raw mid stack than on a structure-oriented
   filtered version. The smoothing removes texture the sample-level attributes rely on.
 - **Alternatives tested.** Selecting raw embedding channels the SOM1.0 way, and SOM inputs built from cosine
