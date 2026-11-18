@@ -257,10 +257,20 @@ def well_strips(ax, wells, well_pos, twt, cmap, width=4, dt=4.0):
         ax.add_patch(plt.Rectangle((x0, twt[t].min() - dt / 2), width, np.ptp(twt[t]) + dt, fill=False, ec="k", lw=0.8, zorder=6))
 
 
-def wiggle_traces(ax, cube, il, xl, twt, lo, hi, half_width=3, sf=0.25):
-    """Variable-area wiggles of the traces around a well (along crossline), using the `wiggle` package."""
-    from wiggle import wiggle
+def wiggle_traces(ax, cube, il, xl, twt, lo, hi, half_width=0, sf=0.45):
+    """Variable-area wiggle display. half_width=0: just the trace at the well (positive lobes filled black);
+    half_width>0: the traces around the well along the crossline, drawn with the `wiggle` package."""
     tt = (twt >= lo) & (twt <= hi)
+    if half_width == 0:
+        tr = cube[il, xl, tt].astype(float)
+        tr = tr / (np.abs(tr).max() + 1e-9) * sf
+        ax.plot(tr, twt[tt], "k", lw=0.8)
+        ax.fill_betweenx(twt[tt], 0, tr, where=tr > 0, color="k", lw=0)
+        ax.axvline(0, color="0.6", lw=0.5)
+        ax.set_xlim(-0.55, 0.55)
+        ax.set_ylim(hi, lo)
+        return
+    from wiggle import wiggle
     xs = np.arange(max(0, xl - half_width), min(cube.shape[1], xl + half_width + 1))
     data = cube[il, xs][:, tt].T
     data = data / (np.abs(data).max() + 1e-9)

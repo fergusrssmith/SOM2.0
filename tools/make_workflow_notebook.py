@@ -46,6 +46,7 @@ DATA = Path(r"C:\Data\Test")                                    # local data roo
 SEISMIC = DATA / "SEGY" / "1988_AVO18.sgy"                       # base seismic volume used by both workflows
 NCS_FEATURES = DATA / "SEGY" / "1988_AVO18_ncs_25d_dir0_dens4"         # NCS 2.5D embedding of the same volume (densify 4)
 LAS_DIR = DATA / "LAS" / "MORE"                                  # well facies logs in TWT (one LAS per well)
+PLOT_WELLS = ["App. 4", "Echo 1", "Echo 3", "Echo 2"]             # wells drawn on the strike line and maps
 VERTICAL_WELLS = ["Echo 1", "Echo 2", "Echo 3", "App. 3", "App. 4"]  # only vertical wells are used: the tie places each
                                                                  # well on one trace, from the LAS X/Y
 FACIES_CURVE = "elastic_lithofluid_facies_upscaled"              # seismic-scale facies curve used for scoring
@@ -134,7 +135,7 @@ counts = pd.DataFrame({n: pd.Series(w[3]).map(dict(enumerate(fac_names))).value_
 counts = counts.reindex(fac_names).fillna(0).astype(int)                 # rows in facies-code order
 majority = counts.sum(1).max() / counts.values.sum()
 print(f"majority-class baseline (predict the most common facies everywhere): {majority:.0%}")
-path, well_pos = sp.well_line(wells, len(ilines), len(xlines))
+path, well_pos = sp.well_line({n: w for n, w in wells.items() if n in PLOT_WELLS}, len(ilines), len(xlines))
 t0 = int(np.searchsorted(twt, top[path[:, 0], path[:, 1]].min() - 50))
 t1 = int(np.searchsorted(twt, base[path[:, 0], path[:, 1]].max() + 50))
 trange = (twt[t0], twt[t1 - 1])
@@ -147,7 +148,7 @@ ext = [xlines[0], xlines[-1], ilines[-1], ilines[0]]
 im = ax[0].imshow(top, cmap="viridis_r", extent=ext, aspect="auto"); plt.colorbar(im, ax=ax[0], label="TWT (ms)")
 ax[0].contour(xlines, ilines, top, levels=12, colors="w", linewidths=0.4)
 ax[0].plot(xlines[path[:, 1]], ilines[path[:, 0]], "w--", lw=1.2, label="section line")
-for w in info:
+for w in [w for w in info if w["well"] in PLOT_WELLS or not w["used"]]:
     ax[0].plot(w["xline"], np.clip(w["inline"], ilines[0], ilines[-1]), "o" if w["used"] else "x",
                color="red" if w["used"] else "orange", ms=8, mec="k")
     if w["used"] or not w["inside_survey"]:
@@ -177,7 +178,7 @@ for ax, (name, (il, xl, t, f)) in zip(axes, wells.items()):
     lo, hi = twt[t].min() - 6, twt[t].max() + 6
     tr = c["DEPT"]; sel = (tr >= lo) & (tr <= hi)
     wax = ax.inset_axes([0.0, 0.0, 0.26, 1.0], transform=ax.transAxes)
-    sp.wiggle_traces(wax, cube, il[0], xl[0], twt, lo, hi, half_width=3, sf=0.3)
+    sp.wiggle_traces(wax, cube, il[0], xl[0], twt, lo, hi, half_width=0, sf=0.45)
     wax.set_xticks([]); wax.set_yticks([]); wax.set_title("seismic", fontsize=7)
     for j, (curve, dt) in enumerate([(RAW_FACIES_CURVE, 2.0), (FACIES_CURVE, 2.0)]):
         for tv, fv in zip(tr[sel], c[curve][sel]):
@@ -196,9 +197,8 @@ sp.facies_legend(fig, [FACIES_NAMES[c] for c in all_codes], sp.facies_cmap(all_c
 plt.tight_layout(rect=(0, 0.05, 1, 1)); plt.show()
 """)
 md(r"""
-*How to read it:* for each well, the seismic around the well as wiggles (7 traces along the crossline; the red line
-marks the well trace), then the raw facies log, the upscaled log, and the facies actually used, one per seismic
-sample. Red lines mark the zone top and base. Thin raw-log beds (tuff,
+*How to read it:* for each well, the seismic trace at the well location (variable-area wiggle), then the raw
+facies log, the upscaled log, and the facies actually used, one per seismic sample. Red lines mark the zone top and base. Thin raw-log beds (tuff,
 carbonaceous) disappear at seismic scale: they are real, but below seismic resolution. Right, how many calibration
 samples each well contributes per facies. Small counts mean noisy per-facies scores.
 """)
@@ -256,17 +256,19 @@ show = sel_idx[:6]
 fig, axes = plt.subplots(len(show), 1, figsize=(14, 2.3 * len(show)), sharex=True)
 for ax, i in zip(axes, show):
     img = sp.zone_to_line(X[:, i], zone_index, path, t0, t1)
-    v = np.nanpercentile(np.abs(img), [2, 98])
-    sp.seismic_line(ax, cube, path, twt, t0, t1)
     lo, hi = np.nanpercentile(img, [2, 98])
-    sp.overlay(ax, img, path, twt, t0, t1, "turbo", lo, hi, alpha=0.75)
+    ax.set_facecolor("0.85")
+    sp.overlay(ax, img, path, twt, t0, t1, "turbo", lo, hi, alpha=1.0)
     sp.decorate_line(ax, trange, well_pos, top, base, path, label=(i == show[0])); ax.set_title(attr_names[i], fontsize=9, loc="left")
 plt.tight_layout(); plt.show()
 del X
 """)
 md(r"""
-*How to read it:* the first six attributes that go into the SOM, shown inside the zone along the line through
-the wells. Each adds information the others don't.
+*How to read it:* the first six attributes that go into the SOM, shown on their own (no seismic underneath)
+inside the zone, along the strike line through the wells. Vertical striping comes from single-trace attributes:
+*banded* attributes average between phase or envelope breaks picked trace by trace, and Q, attenuation,
+acceleration of phase and thin bed spike where the envelope is near zero. It is not an edge effect: attributes
+are computed on the whole trace and only then sampled in the zone.
 """)
 code(r"""
 with som2.timer("SOM1.0 SOM"):
@@ -354,9 +356,8 @@ md("### QC: what the embedding sees")
 code(r"""
 fig, ax = plt.subplots(4, 1, figsize=(14, 13), sharex=True)
 ch = E[..., 0].T
-sp.seismic_line(ax[0], cube, path, twt, t0, t1)
-sp.overlay(ax[0], ch, path, twt, t0, t1, "viridis", *np.percentile(ch, [2, 98]), alpha=0.75)
-ax[0].set_title("One embedding channel (channel 0): each of the 768 channels is a learned pattern detector", loc="left", fontsize=9)
+sp.overlay(ax[0], ch, path, twt, t0, t1, "viridis", *np.percentile(ch, [2, 98]), alpha=1.0)
+ax[0].set_title("Embedding channel 0 on its own (no seismic): note the vertical bands, a tile-position artefact (see below)", loc="left", fontsize=9)
 sim = (En @ ref).T
 sp.seismic_line(ax[1], cube, path, twt, t0, t1)
 im = sp.overlay(ax[1], sim, path, twt, t0, t1, "RdYlBu_r", -0.2, 1.0, alpha=0.75)
@@ -372,12 +373,63 @@ ax[-1].set_xlabel("trace along line"); plt.tight_layout(); plt.show()
 """)
 md(r"""
 *How to read it:*
-- **Top:** one of the 768 embedding channels, a pattern the model learned during pre-training.
+- **Top:** embedding channel 0 on its own. Its vertical bands are not geology; see the tiling check below.
 - **Second:** pick one point (the star, in oil sand) and colour every location by how similar its embedding is.
   The model groups the reservoir interval laterally without being told anything about it.
 - **Bottom two:** the first three components of each workflow's features, shown as colours. Colour changes are
   what the SOM can separate. The attribute blend (SOM1.0) changes at the scale of individual wavelet loops. The
   embedding blend (SOM2.0) changes at the scale of geological units.
+""")
+
+md(r"""
+### QC: raw embedding channels and the tiling artefact
+Inference tiles the volume into overlapping 224 × 224 crops. A ViT token carries information about where it sits
+in its crop, so some channels repeat with the tile spacing. Below: 16 channels on the native feature grid with no
+seismic and no interpolation, as an inline section and as a time slice. Then, for every channel and the leading
+PCs, the share of variance explained purely by position within the tile along the crossline.
+""")
+code(r"""
+G = np.asarray(F.values, np.float32)                                   # native grid (inline, xline, time, 768)
+Gz = (G - G.mean((0, 1, 2))) / (G.std((0, 1, 2)) + 1e-9)
+xs = ds["xline"].values; step = int(xs[1] - xs[0])
+TILE = 224                                                             # crop width in traces (NCS default)
+phase = ((xs - xs[0]) % TILE) // step
+
+def tile_share(v):                                                     # variance share explained by tile phase
+    m = np.array([v[:, phase == q].mean() for q in np.unique(phase)]); c = np.array([(phase == q).sum() for q in np.unique(phase)])
+    return float((c * m ** 2).sum() / c.sum() / (v ** 2).mean())
+
+share_ch = np.array([tile_share(Gz[..., c]) for c in range(Gz.shape[-1])])
+show_ch = np.r_[0, np.random.default_rng(0).choice(np.arange(1, Gz.shape[-1]), 15, replace=False)]
+fi_line = int(np.argmin(np.abs(gi - path[len(path) // 2, 0])))
+kt = int(np.argmin(np.abs(twt[0] + gt * (twt[1] - twt[0]) - (np.median(top) + 60))))
+fig, axes = plt.subplots(4, 8, figsize=(22, 11))
+for j, c in enumerate(show_ch):
+    a = axes.ravel()[j]; v = G[fi_line, :, :, c].T; lo, hi = np.percentile(v, [2, 98])
+    a.imshow(v, cmap="viridis", vmin=lo, vmax=hi, aspect="auto", interpolation="nearest"); a.set_title(f"ch {c} (tile {share_ch[c]:.0%})", fontsize=8)
+    a = axes.ravel()[16 + j]; v = G[:, :, kt, c]; lo, hi = np.percentile(v, [2, 98])
+    a.imshow(v, cmap="viridis", vmin=lo, vmax=hi, aspect="equal", interpolation="nearest"); a.set_title(f"ch {c} time slice", fontsize=8)
+for a in axes.ravel(): a.set_xticks([]); a.set_yticks([])
+fig.suptitle(f"Rows 1-2: inline {ilines[int(round(gi[fi_line]))]} sections; rows 3-4: time slice ~{twt[0] + gt[kt] * (twt[1] - twt[0]):.0f} ms (x = crossline). Native grid, no seismic.", fontsize=11)
+plt.tight_layout(); plt.show()
+
+Pz = (Gz.reshape(-1, Gz.shape[-1]) @ pca2["comps"][:k2].T).reshape(*Gz.shape[:3], k2)
+share_pc = np.array([tile_share((Pz[..., k] - Pz[..., k].mean()) / Pz[..., k].std()) for k in range(k2)])
+fig, ax = plt.subplots(1, 2, figsize=(15, 3.6))
+ax[0].hist(share_ch, bins=50, color="steelblue"); ax[0].set(title="Embedding channels: variance explained by tile position", xlabel="share of variance", ylabel="channels"); ax[0].set_yscale("log")
+ax[1].bar(range(1, k2 + 1), share_pc, color=["crimson" if v > 0.2 else "steelblue" for v in share_pc]); ax[1].axhline(0.2, color="k", ls="--", lw=1)
+ax[1].set(title=f"SOM2.0 input PCs: variance explained by tile position (red > 20%)", xlabel="PC", ylim=(0, 1))
+plt.tight_layout(); plt.show()
+print(f"channels with >10% tile-position variance: {np.sum(share_ch > 0.1)} of {len(share_ch)}; PCs >20%: {list(np.where(share_pc > 0.2)[0] + 1)}")
+del G, Gz, Pz
+""")
+md(r"""
+*How to read it:* most channels show geology (layering in section, channels and structure in the time slice). A
+minority show bands that repeat with the crop spacing along the crossline, the tile-position artefact. Channel 0
+is the clearest case. The bar chart shows how much of each SOM2.0 input PC follows tile position. PCs flagged in
+red feed the artefact into the SOM, which shows up as vertical boundaries in the neuron sections. Remedies: rerun
+inference with more crop overlap (`num_overlap_patches`) or average runs with shifted tile origins; or drop or
+regress out the affected PCs.
 """)
 code(r"""
 fig, ax = plt.subplots(1, 2, figsize=(13, 3.4))
@@ -566,7 +618,7 @@ im = ax[2].imshow(m, cmap="YlOrBr", vmin=0, vmax=1, extent=ext, aspect="auto"); 
 ax[2].set_title(f"{best2}: mean P(oil sand), top reservoir to +{MAP_WINDOW_MS} ms")
 for a in ax:
     a.plot(xlines[path[:, 1]], ilines[path[:, 0]], "w--", lw=0.8)
-    for n, w in wells.items():
+    for n, w in [(n, w) for n, w in wells.items() if n in PLOT_WELLS]:
         a.plot(xlines[w[1][0]], ilines[w[0][0]], "o", color="red", mec="k"); a.text(xlines[w[1][0]] + 6, ilines[w[0][0]], n, fontsize=8, color="k", bbox=dict(fc="w", lw=0, alpha=0.75, pad=1))
     a.set(xlabel="crossline", ylabel="inline")
 sp.facies_legend(fig, fac_names, fac_cmap); plt.tight_layout(rect=(0, 0.06, 1, 1)); plt.show()
