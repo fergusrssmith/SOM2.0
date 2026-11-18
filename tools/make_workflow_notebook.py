@@ -95,7 +95,13 @@ md(r"""
 ## 3 · Well tie
 Well locations come from the LAS header (X/Y), mapped to inline/crossline with an affine fit to the SEG-Y trace
 headers. Wells are treated as vertical. The facies log, in TWT, is put on the seismic sample grid by majority vote
-within ± half a sample; code 0 (unclassified) is dropped.
+within ± half a seismic sample. Ties go to the log sample nearest the seismic time. Code 0 (unclassified) is
+dropped.
+
+**Which facies curve:** use the *upscaled* (seismic-scale) curve for calibration and scoring. A raw curve adds beds
+of a few milliseconds, one or two seismic samples thick, that no seismic method can resolve. In tests they were
+never predicted and only lowered the scores. Resampling the seismic to 1 ms to match a finer log adds no
+resolution either, because the band-limited data carry the same frequencies at either rate.
 """)
 code(r"""
 wells_raw, info = som2.well_facies_on_grid(sorted(LAS_DIR.glob("*.las")), FACIES_CURVE, to_ilxl, ilines, xlines, twt)

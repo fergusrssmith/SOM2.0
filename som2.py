@@ -132,9 +132,13 @@ def survey_affine(segy):
 
 
 def well_facies_on_grid(las_paths, curve, to_ilxl, ilines, xlines, twt, null_code=0):
-    """Vertical wells: LAS facies log in TWT -> one code per seismic sample (majority vote within +/- half a
-    sample). Returns (wells, info): wells = {name: (il_idx, xl_idx, t_idx, codes)} for wells inside the survey."""
-    half = float(np.median(np.diff(twt))) / 2
+    """Vertical wells: LAS facies log in TWT -> one code per seismic sample.
+
+    If the seismic is coarser than the log, each seismic sample takes the majority facies of the log samples within
+    +/- half a seismic sample; ties go to the log sample nearest the seismic time (not to the lowest code). If the
+    seismic is as fine as or finer than the log, each seismic sample takes the nearest log sample (within half a
+    log step). Returns (wells, info): wells = {name: (il_idx, xl_idx, t_idx, codes)} for wells inside the survey."""
+    dt_seis = float(np.median(np.diff(twt)))
     wells, info = {}, []
     for p in las_paths:
         hdr, c = read_las(p)
@@ -146,14 +150,26 @@ def well_facies_on_grid(las_paths, curve, to_ilxl, ilines, xlines, twt, null_cod
         if not inside:
             continue
         t, f = c["DEPT"], c[curve]
+        ok = np.isfinite(f)
+        t, f = t[ok], f[ok].astype(int)
+        dt_log = float(np.median(np.diff(t)))
         ks, codes = [], []
         for k, ts in enumerate(twt):
-            w = (np.abs(t - ts) <= half) & np.isfinite(f)
-            if w.any():
-                vals, cnt = np.unique(f[w].astype(int), return_counts=True)
-                code = int(vals[cnt.argmax()])
-                if code != null_code:
-                    ks.append(k), codes.append(code)
+            d = np.abs(t - ts)
+            if dt_seis > dt_log:                                   # coarser seismic: majority, nearest breaks ties
+                w = d <= dt_seis / 2
+                if not w.any():
+                    continue
+                vals, cnt = np.unique(f[w], return_counts=True)
+                tied = vals[cnt == cnt.max()]
+                code = int(tied[0]) if len(tied) == 1 else int(f[w][np.argmin(np.where(np.isin(f[w], tied), d[w], np.inf))])
+            else:                                                  # finer (or equal) seismic: nearest log sample
+                j = int(np.argmin(d))
+                if d[j] > dt_log / 2 + 1e-6:
+                    continue
+                code = int(f[j])
+            if code != null_code:
+                ks.append(k), codes.append(code)
         n = len(ks)
         wells[name] = (np.full(n, i), np.full(n, x), np.array(ks, int), np.array(codes, int))
     return wells, info
@@ -184,8 +200,12 @@ def som1_attribute_names():
     return inst + banded
 
 
-def som1_attributes(cube, dt_ms, mask, smooth_n=5, energy_n=11):
-    """Return (names, X): the ~36 SOM1.0 single-trace attributes, sampled on the zone."""
+def som1_attributes(cube, dt_ms, mask, smooth_ms=20.0, energy_ms=44.0, break_ms=20.0, rai_smooth_ms=12.0):
+    """Return (names, X): the ~36 SOM1.0 single-trace attributes, sampled on the zone.
+    Window lengths are in milliseconds, so results do not depend on the sample rate (at 4 ms they are
+    5, 11, 5 and 3 samples)."""
+    nwin = lambda ms: max(1, int(round(ms / dt_ms))) | 1                  # noqa: E731  odd sample count
+    smooth_n, energy_n, break_n, rai_n = nwin(smooth_ms), nwin(energy_ms), nwin(break_ms), nwin(rai_smooth_ms)
     names = som1_attribute_names()
     X = np.empty((int(mask.sum()), len(names)), np.float32)
     col = iter(range(len(names)))
@@ -210,7 +230,7 @@ def som1_attributes(cube, dt_ms, mask, smooth_n=5, energy_n=11):
     att = np.abs(de) / np.maximum(np.abs(sfreq), 1.0)
     sweet = env / np.maximum(np.abs(sfreq), 1.0)
     rai = np.cumsum(a - a.mean(-1, keepdims=True), axis=-1)
-    rai = ndimage.uniform_filter1d(rai - ndimage.uniform_filter1d(rai, max(3, int(100 / dt_ms)), axis=-1), 3, axis=-1)
+    rai = ndimage.uniform_filter1d(rai - ndimage.uniform_filter1d(rai, max(3, int(100 / dt_ms)), axis=-1), rai_n, axis=-1)
     for v in (a, h, env, phw, freq, np.cos(phw), de, d2e, np.gradient(freq, dt_s, axis=-1), bwid, sfreq, thin, q,
               att, sweet, rai):
         put(v)
@@ -224,7 +244,7 @@ def som1_attributes(cube, dt_ms, mask, smooth_n=5, energy_n=11):
     pb[..., 1:] = np.diff(phw, axis=-1) < -np.pi
     eb = np.zeros(a.shape, bool)
     eb[..., 1:-1] = (env[..., 1:-1] < env[..., :-2]) & (env[..., 1:-1] <= env[..., 2:])
-    han = np.hanning(5)[None, None] / np.hanning(5).max()
+    han = np.hanning(break_n)[None, None] / np.hanning(break_n).max()
     put(ndimage.convolve(pb.astype(np.float32), han, mode="nearest"))
     put(ndimage.convolve(eb.astype(np.float32), han, mode="nearest"))
     put(_segment_mean(env, pb)); put(_segment_mean(env, eb)); put(_segment_mean(freq, pb))
