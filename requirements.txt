@@ -8,3 +8,4 @@ zarr
 jupyter
 # optional: torch (GPU SOM training) and the NCS model code for creating embeddings:
 # pip install -e "git+https://github.com/NorskRegnesentral/NCS_models.git#egg=NCS[inference]"
+wiggle

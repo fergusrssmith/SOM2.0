@@ -404,8 +404,18 @@ def pca_transform(X, p, k, chunk=500_000):
 # =====================================================================================
 # Self-organising map (batch algorithm; identical settings for SOM1.0 and SOM2.0)
 # =====================================================================================
-def train_som(Z, shape=(8, 8), epochs=25, n_train=150_000, sigma0=None, sigma1=0.6, seed=0, n_snap=16):
-    """Batch SOM with PCA-plane initialisation. Returns (W, snapshots of W[:, :2])."""
+def som_coords(shape, topology="hex"):
+    """Map-space position of each neuron k = row * C + col. "hex": odd rows shifted half a cell, rows sqrt(3)/2
+    apart, so every interior neuron has 6 equidistant neighbours; "rect": plain grid (4 neighbours)."""
+    R, C = shape
+    r, c = np.divmod(np.arange(R * C), C)
+    if topology == "hex":
+        return np.stack([r * np.sqrt(3) / 2, c + 0.5 * (r % 2)], 1)
+    return np.stack([r, c], 1).astype(float)
+
+
+def train_som(Z, shape=(8, 8), epochs=25, n_train=150_000, sigma0=None, sigma1=0.6, seed=0, n_snap=16, topology="hex"):
+    """Batch SOM (hexagonal map by default) with PCA-plane initialisation. Returns (W, snapshots of W[:, :2])."""
     rng = np.random.default_rng(seed)
     S = Z[rng.choice(len(Z), min(n_train, len(Z)), replace=False)].astype(np.float32)
     R, C = shape
@@ -416,7 +426,8 @@ def train_som(Z, shape=(8, 8), epochs=25, n_train=150_000, sigma0=None, sigma1=0
     W[:, 0] = (grid[:, 1] / (C - 1) - 0.5) * 2 * sd[0] * 0.2
     W[:, 1] = (grid[:, 0] / (R - 1) - 0.5) * 2 * sd[1] * 0.2
     sigma0 = sigma0 or max(R, C) / 2
-    D2 = ((grid[:, None] - grid[None]) ** 2).sum(-1)
+    pos = som_coords(shape, topology)
+    D2 = ((pos[:, None] - pos[None]) ** 2).sum(-1)
     snaps = [W[:, :2].copy()]
     use_t = torch is not None
     if use_t:
@@ -462,7 +473,7 @@ def node_colours(shape):
 # =====================================================================================
 # Well calibration and leave-one-well-out scoring
 # =====================================================================================
-def calibrate(node_of_sample, fac, n_nodes, n_fac, shape, smooth=0.9, prior_power=0.5):
+def calibrate(node_of_sample, fac, n_nodes, n_fac, shape, smooth=0.9, prior_power=0.5, topology="hex"):
     """Biggest winner, plus a Bayesian version: P(facies | node) ∝ P(node | facies) · P(facies)^prior_power.
 
     P(node | facies) comes from well counts smoothed over neighbouring SOM nodes. prior_power=1 is the
@@ -473,8 +484,7 @@ def calibrate(node_of_sample, fac, n_nodes, n_fac, shape, smooth=0.9, prior_powe
     np.add.at(counts, (node_of_sample, fac), 1)
     winner = np.where(counts.sum(1) > 0, counts.argmax(1), -1)
     R, C = shape
-    gy, gx = np.mgrid[0:R, 0:C]
-    g = np.stack([gy.ravel(), gx.ravel()], 1)
+    g = som_coords(shape, topology)
     K = np.exp(-((g[:, None] - g[None]) ** 2).sum(-1) / (2 * smooth ** 2))
     sm = K @ counts + 1e-3
     lik = sm / sm.sum(0, keepdims=True)                     # P(node | facies)
@@ -507,14 +517,14 @@ def calibration_samples(wells, zone_index, radius=1):
     return zi[zi >= 0], fa[zi >= 0]
 
 
-def leave_one_well_out(bmu_zone, wells, zone_index, n_fac, shape, radius=1):
+def leave_one_well_out(bmu_zone, wells, zone_index, n_fac, shape, radius=1, topology="hex"):
     """Calibrate on all wells but one, predict the held-out well trace, rotate. Both calibration methods."""
     n_nodes = shape[0] * shape[1]
     pooled = {"winner": ([], []), "prob": ([], [])}
     per_well = {}
     for held in wells:
         zi, fa = calibration_samples({k: v for k, v in wells.items() if k != held}, zone_index, radius)
-        _, win, post = calibrate(bmu_zone[zi], fa, n_nodes, n_fac, shape)
+        _, win, post = calibrate(bmu_zone[zi], fa, n_nodes, n_fac, shape, topology=topology)
         il, xl, t, f = wells[held]
         tz = zone_index[il, xl, t]
         keep = tz >= 0

@@ -99,54 +99,102 @@ def rgb_line(values_rgb, zone_index, path, t0, t1):
     return img.transpose(1, 0, 2)
 
 
-# ------------------------------------------------------------------------------------------------ SOM views
-def node_grid(ax, values, shape, cmap="viridis", title="", fmt=None, vmin=None, vmax=None, colors=None):
-    """Draw one value per SOM node as an R x C grid (or explicit RGB `colors`)."""
+# ------------------------------------------------------------------------------------------------ SOM views (hexagonal)
+from matplotlib.patches import RegularPolygon  # noqa: E402
+from matplotlib.cm import ScalarMappable  # noqa: E402
+from matplotlib.colors import Normalize, to_rgb  # noqa: E402
+
+
+def _hex_centres(shape):
+    """Neuron k = row * C + col drawn on a hexagonal lattice: odd rows shifted half a cell (same as som2.som_coords)."""
     R, C = shape
-    if colors is not None:
-        ax.imshow(np.asarray(colors).reshape(R, C, 3) / (255 if np.max(colors) > 1 else 1), interpolation="nearest")
-    else:
-        im = ax.imshow(np.asarray(values, float).reshape(R, C), cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
-        plt.colorbar(im, ax=ax, fraction=0.046)
-    if fmt is not None and values is not None:
-        for k, v in enumerate(values):
-            ax.text(k % C, k // C, fmt(v), ha="center", va="center", fontsize=6, color="w")
-    ax.set_xticks([]), ax.set_yticks([])
+    r, c = np.divmod(np.arange(R * C), C)
+    return np.stack([c + 0.5 * (r % 2), -r * np.sqrt(3) / 2], 1)
+
+
+def hex_map(ax, shape, facecolors, labels=None, edgecolor="0.35", hatch=None, title="", fontsize=6, text_colors=None):
+    """Draw one hexagon per neuron. facecolors: (n, 3|4) in [0, 1]; labels: per-neuron strings; hatch: bool mask."""
+    xy = _hex_centres(shape)
+    for k, (x, y) in enumerate(xy):
+        ax.add_patch(RegularPolygon((x, y), 6, radius=0.57, orientation=0, facecolor=facecolors[k], edgecolor=edgecolor,
+                                    lw=0.6, hatch="////" if hatch is not None and hatch[k] else None))
+        if labels is not None and labels[k]:
+            ax.text(x, y, labels[k], ha="center", va="center", fontsize=fontsize,
+                    color=(text_colors[k] if text_colors is not None else "k"))
+    ax.set_xlim(xy[:, 0].min() - 0.7, xy[:, 0].max() + 0.7)
+    ax.set_ylim(xy[:, 1].min() - 0.7, xy[:, 1].max() + 0.7)
+    ax.set_aspect("equal"), ax.set_xticks([]), ax.set_yticks([])
     ax.set_title(title, fontsize=10)
 
 
-def u_matrix(W, shape):
-    """Mean distance from each node to its grid neighbours (high = boundary between clusters)."""
+def node_grid(ax, values, shape, cmap="viridis", title="", fmt=None, vmin=None, vmax=None, colors=None):
+    """One value (or explicit RGB colour) per neuron, on the hexagonal map, with a colour bar for values."""
+    if colors is not None:
+        fc = np.asarray(colors, float)
+        fc = fc / 255 if fc.max() > 1 else fc
+        hex_map(ax, shape, fc, title=title)
+        return
+    v = np.asarray(values, float)
+    norm = Normalize(vmin=np.nanmin(v) if vmin is None else vmin, vmax=np.nanmax(v) if vmax is None else vmax)
+    cm = plt.get_cmap(cmap)
+    fc = cm(norm(v))
+    labels = [fmt(x) for x in v] if fmt else None
+    tc = ["w" if (0.299 * f[0] + 0.587 * f[1] + 0.114 * f[2]) < 0.5 else "k" for f in fc]
+    hex_map(ax, shape, fc, labels, title=title, text_colors=tc)
+    plt.colorbar(ScalarMappable(norm=norm, cmap=cm), ax=ax, fraction=0.046)
+
+
+def u_matrix(W, shape, topology="hex"):
+    """Mean distance from each neuron to its map neighbours (high = boundary between clusters)."""
     R, C = shape
-    Wg = W.reshape(R, C, -1)
-    u = np.zeros((R, C))
-    for r in range(R):
-        for c in range(C):
-            d = [np.linalg.norm(Wg[r, c] - Wg[rr, cc]) for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
-                 if 0 <= rr < R and 0 <= cc < C]
-            u[r, c] = np.mean(d)
-    return u.ravel()
+    r, c = np.divmod(np.arange(R * C), C)
+    pos = np.stack([r * np.sqrt(3) / 2, c + 0.5 * (r % 2)], 1) if topology == "hex" else np.stack([r, c], 1).astype(float)
+    d = np.sqrt(((pos[:, None] - pos[None]) ** 2).sum(-1))
+    nb = (d > 0) & (d < 1.01)
+    dist = np.sqrt(((W[:, None] - W[None]) ** 2).sum(-1))
+    return np.array([dist[k, nb[k]].mean() for k in range(R * C)])
 
 
 def node_facies_bars(ax, counts, shape, cmap, title=""):
-    """Stacked facies fractions of the calibration samples inside each node; empty nodes are hatched."""
-    R, C = shape
-    ax.set_xlim(-0.5, C - 0.5), ax.set_ylim(R - 0.5, -0.5)
-    for k in range(R * C):
-        r, c = divmod(k, C)
+    """Facies mix of the calibration samples captured by each neuron (stacked bar inside each hexagon);
+    hatched = no well sample landed on that neuron."""
+    xy = _hex_centres(shape)
+    hex_map(ax, shape, np.ones((len(xy), 3)), hatch=counts.sum(1) == 0, title=title)
+    for k, (x, y) in enumerate(xy):
         tot = counts[k].sum()
-        ax.add_patch(plt.Rectangle((c - 0.45, r - 0.45), 0.9, 0.9, fill=False, lw=0.6, ec="0.6",
-                                   hatch="///" if tot == 0 else None))
-        y = r + 0.45
+        if not tot:
+            continue
+        y0 = y - 0.38
         for f in range(counts.shape[1]):
             if counts[k, f]:
-                h = 0.9 * counts[k, f] / tot
-                ax.add_patch(plt.Rectangle((c - 0.3, y - h), 0.6, h, color=cmap(f), lw=0))
-                y -= h
-        if tot:
-            ax.text(c, r - 0.3, int(tot), ha="center", va="center", fontsize=6)
-    ax.set_xticks([]), ax.set_yticks([]), ax.set_aspect("equal")
-    ax.set_title(title, fontsize=10)
+                h = 0.76 * counts[k, f] / tot
+                ax.add_patch(plt.Rectangle((x - 0.2, y0), 0.4, h, color=cmap(f), lw=0))
+                y0 += h
+        ax.text(x, y + 0.45, int(tot), ha="center", va="center", fontsize=5)
+
+
+def facies_topology(ax, counts, post, shape, cmap, names, title="", numbers=True):
+    """Winning facies per neuron ('facies topology'): colour = most probable facies (paler = less
+    certain), label = neuron number and probability; white = no well sample on that neuron (its facies is inferred
+    from neighbouring neurons)."""
+    win = post.argmax(1)
+    pr = post.max(1)
+    seen = counts.sum(1) > 0
+    fc = []
+    for k in range(len(win)):
+        base = np.array(to_rgb(cmap(win[k])))
+        a = 0.3 + 0.7 * np.clip((pr[k] - 1 / post.shape[1]) / (1 - 1 / post.shape[1]), 0, 1)
+        fc.append(base * a + (1 - a) if seen[k] else np.array([1.0, 1.0, 1.0]))
+    labels = [(f"{k + 1}\n" if numbers else "") + f"P={pr[k]:.2f}" for k in range(len(win))]
+    hex_map(ax, shape, np.array(fc), labels, title=title, fontsize=5)
+
+
+def neuron_key(ax, shape, node_rgb, title="neuron colour key", numbers=True):
+    labels = [str(k + 1) for k in range(shape[0] * shape[1])] if numbers else None
+    fc = np.asarray(node_rgb, float)
+    fc = fc / 255 if fc.max() > 1 else fc
+    tc = ["w" if (0.299 * f[0] + 0.587 * f[1] + 0.114 * f[2]) < 0.5 else "k" for f in fc]
+    hex_map(ax, shape, fc, labels, title=title, text_colors=tc)
 
 
 def confusion(ax, cm, names, title=""):
@@ -170,16 +218,17 @@ def facies_cmap(codes, colours):
 
 
 def component_planes(W, labels, shape, title="", ncols=8, max_n=24):
-    """Kohonen component planes: one SOM-grid map per input variable (red = high). Returns the figure."""
+    """Kohonen component planes on the hexagonal map: one map per input variable (red = high)."""
     n = min(len(labels), max_n)
     rows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(rows, ncols, figsize=(1.9 * ncols, 2.0 * rows + 0.5))
+    fig, axes = plt.subplots(rows, ncols, figsize=(1.9 * ncols, 1.9 * rows + 0.5))
+    cm = plt.get_cmap("RdBu_r")
     for k, ax in enumerate(np.ravel(axes)):
         if k < n:
-            ax.imshow(W[:, k].reshape(shape), cmap="RdBu_r", interpolation="nearest")
-            ax.set_title(labels[k], fontsize=7)
-        ax.set_xticks([]), ax.set_yticks([])
-        if k >= n:
+            v = W[:, k]
+            hex_map(ax, shape, cm(Normalize(v.min(), v.max())(v)), edgecolor="none", title=labels[k])
+            ax.title.set_fontsize(7)
+        else:
             ax.axis("off")
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()
@@ -194,3 +243,27 @@ def selection_curve(ax, names, r2, target, title=""):
     ax.set_ylim(0, 1)
     ax.set_ylabel("variance of all candidates reconstructed")
     ax.set_title(title, fontsize=10)
+
+
+# ------------------------------------------------------------------------------------------------ wells on sections
+def well_strips(ax, wells, well_pos, twt, cmap, width=4, dt=4.0):
+    """Draw each well's facies log as a narrow coloured column at its position on a section (black outline)."""
+    for name, (il, xl, t, f) in wells.items():
+        if name not in well_pos:
+            continue
+        x0 = well_pos[name] - width / 2
+        for tv, fv in zip(twt[t], f):
+            ax.add_patch(plt.Rectangle((x0, tv - dt / 2), width, dt, color=cmap(fv), lw=0, zorder=5))
+        ax.add_patch(plt.Rectangle((x0, twt[t].min() - dt / 2), width, np.ptp(twt[t]) + dt, fill=False, ec="k", lw=0.8, zorder=6))
+
+
+def wiggle_traces(ax, cube, il, xl, twt, lo, hi, half_width=3, sf=0.25):
+    """Variable-area wiggles of the traces around a well (along crossline), using the `wiggle` package."""
+    from wiggle import wiggle
+    tt = (twt >= lo) & (twt <= hi)
+    xs = np.arange(max(0, xl - half_width), min(cube.shape[1], xl + half_width + 1))
+    data = cube[il, xs][:, tt].T
+    data = data / (np.abs(data).max() + 1e-9)
+    wiggle(data, tt=twt[tt], xx=np.arange(len(xs), dtype=float), ax=ax, color="k", sf=sf)
+    ax.axvline(xl - xs[0], color="r", lw=0.8, alpha=0.6)
+    ax.set_ylim(hi, lo)

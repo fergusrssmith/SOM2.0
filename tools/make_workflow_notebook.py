@@ -45,16 +45,21 @@ from pathlib import Path
 DATA = Path(r"C:\Data\Test")                                    # local data root (nothing is uploaded)
 SEISMIC = DATA / "SEGY" / "1988_AVO18.sgy"                       # base seismic volume used by both workflows
 NCS_FEATURES = DATA / "SEGY" / "1988_AVO18_ncs_25d_dir0_dens4"         # NCS 2.5D embedding of the same volume (densify 4)
-LAS_DIR = DATA / "LAS"                                           # well facies logs in TWT (one LAS per well)
+LAS_DIR = DATA / "LAS" / "MORE"                                  # well facies logs in TWT (one LAS per well)
+VERTICAL_WELLS = ["Echo 1", "Echo 2", "Echo 3", "App. 3", "App. 4"]  # only vertical wells are used: the tie places each
+                                                                 # well on one trace, from the LAS X/Y
 FACIES_CURVE = "elastic_lithofluid_facies_upscaled"              # seismic-scale facies curve used for scoring
 RAW_FACIES_CURVE = "elastic_lithofluid_facies"                   # raw curve, shown for context only
 TOP_HORIZON = DATA / "Horizons" / "Balder.txt"                   # analysis zone: top ...
 BASE_HORIZON = DATA / "Horizons" / "MAURT.txt"                   # ... and base
 FACIES_NAMES = {1: "Brine sand", 2: "Soft shale", 3: "Shale", 4: "Oil sand", 7: "Tuff", 8: "Overburden",
                 10: "Carbonaceous"}
-FACIES_COLOURS = {1: "#4e9fd6", 2: "#9a8c6a", 3: "#7a7a7a", 4: "#e8b33a", 7: "#b07cc6", 8: "#3d3d3d",
+FACIES_COLOURS = {1: "#f2d03b", 2: "#9a8c6a", 3: "#7a7a7a", 4: "#2e9e47", 7: "#b07cc6", 8: "#3d3d3d",
                   10: "#c2410c"}
-SOM_SHAPE = (8, 8)
+SOM_SHAPE = (8, 8)               # neurons, on a hexagonal map (6 neighbours each)
+MAP_HORIZON = DATA / "Horizons" / "REST.txt"                      # top reservoir: maps are extracted along it ...
+MAP_OFFSET_MS = 8                # ... this far below it (the pick is not perfect)
+MAP_WINDOW_MS = 20               # P(oil sand) maps average this window below the horizon
 ATTR_R_MAX = 0.8                 # SOM1.0: no two selected attributes correlated |r| >= this
 ATTR_VAR_TARGET = 0.90           # SOM1.0: add distinct attributes until they reconstruct this share of all-attribute variance
 NCS_PC_VAR = 0.70                # SOM2.0: embedding variance captured by the PCs fed to the SOM
@@ -94,7 +99,10 @@ print(f"inline/xline <-> X/Y affine fit residual {resid:.2f} m")
 md(r"""
 ## 3 · Well tie
 Well locations come from the LAS header (X/Y), mapped to inline/crossline with an affine fit to the SEG-Y trace
-headers. Wells are treated as vertical. The facies log, in TWT, is put on the seismic sample grid by majority vote
+headers. Each well is placed on a single trace, so **only vertical wells are used** (`VERTICAL_WELLS`). A deviated
+well's facies would land on the wrong trace. This makes the result sensitive to the well ties: a time or position
+mis-tie moves labels onto the wrong seismic. The calibration footprint (the traces around each well) softens
+lateral errors but not time shifts. The facies log, in TWT, is put on the seismic sample grid by majority vote
 within ± half a seismic sample. Ties go to the log sample nearest the seismic time. Code 0 (unclassified) is
 dropped.
 
@@ -106,6 +114,10 @@ resolution either, because the band-limited data carry the same frequencies at e
 code(r"""
 las = sorted(LAS_DIR.glob("*.las"))
 wells_raw, info = som2.well_facies_on_grid(las, FACIES_CURVE, to_ilxl, ilines, xlines, twt)
+for w in info:
+    w["used"] = w["inside_survey"] and w["well"] in VERTICAL_WELLS
+    w["note"] = "used" if w["used"] else ("outside survey" if not w["inside_survey"] else "not used: deviated")
+wells_raw = {n: v for n, v in wells_raw.items() if n in VERTICAL_WELLS}
 display(pd.DataFrame(info))
 codes = sorted({int(c) for (_, _, _, f) in wells_raw.values() for c in f})
 code_to_k = {c: k for k, c in enumerate(codes)}
@@ -134,11 +146,12 @@ im = ax[0].imshow(top, cmap="viridis_r", extent=ext, aspect="auto"); plt.colorba
 ax[0].contour(xlines, ilines, top, levels=12, colors="w", linewidths=0.4)
 ax[0].plot(xlines[path[:, 1]], ilines[path[:, 0]], "w--", lw=1.2, label="section line")
 for w in info:
-    inside = w["inside_survey"]
-    ax[0].plot(w["xline"], np.clip(w["inline"], ilines[0], ilines[-1]), "o" if inside else "x",
-               color="red" if inside else "orange", ms=8, mec="k")
-    ax[0].text(w["xline"] + 6, np.clip(w["inline"], ilines[0], ilines[-1]),
-               w["well"] + ("" if inside else " (outside survey)"), color="w", fontsize=8)
+    ax[0].plot(w["xline"], np.clip(w["inline"], ilines[0], ilines[-1]), "o" if w["used"] else "x",
+               color="red" if w["used"] else "orange", ms=8, mec="k")
+    if w["used"] or not w["inside_survey"]:
+        lab = w["well"] if w["used"] else f"{w['well']} (outside survey)"
+        ax[0].text(w["xline"] + 6, np.clip(w["inline"], ilines[0], ilines[-1]), lab, color="k", fontsize=8,
+                   bbox=dict(fc="w", lw=0, alpha=0.7, pad=1))
 ax[0].set(title="Top horizon time structure + wells", xlabel="crossline", ylabel="inline"); ax[0].legend(loc="lower right", fontsize=8)
 im = ax[1].imshow(base - top, cmap="magma", extent=ext, aspect="auto"); plt.colorbar(im, ax=ax[1], label="ms")
 ax[1].set(title="Analysis zone thickness (base - top)", xlabel="crossline", ylabel="inline")
@@ -150,7 +163,7 @@ plt.tight_layout(); plt.show()
 """)
 md(r"""
 *How to read it:* left, the top-horizon time structure, with the wells and the section line used throughout.
-Wells marked × fall outside the 3D and can't be used. Middle, the zone thickness: every sample inside it is
+Red circles are the vertical wells used. Wells marked × are deviated or outside the 3D, and aren't used. Middle, the zone thickness: every sample inside it is
 classified. Right, the seismic along the line through the wells, with the zone shaded between the two horizons.
 """)
 
@@ -161,9 +174,9 @@ for ax, (name, (il, xl, t, f)) in zip(axes, wells.items()):
     hdr, c = som2.read_las(next(p for p in las if som2.read_las(p)[0].get("WELL") == name))
     lo, hi = twt[t].min() - 6, twt[t].max() + 6
     tr = c["DEPT"]; sel = (tr >= lo) & (tr <= hi)
-    trace = cube[il[0], xl[0]]; tt = (twt >= lo) & (twt <= hi)
-    ax.plot(trace[tt] / np.abs(trace[tt]).max() * 0.45 + 0.5, twt[tt], "k", lw=0.8)
-    ax.fill_betweenx(twt[tt], 0.5, trace[tt] / np.abs(trace[tt]).max() * 0.45 + 0.5, where=trace[tt] > 0, color="k")
+    wax = ax.inset_axes([0.0, 0.0, 0.26, 1.0], transform=ax.transAxes)
+    sp.wiggle_traces(wax, cube, il[0], xl[0], twt, lo, hi, half_width=3, sf=0.3)
+    wax.set_xticks([]); wax.set_yticks([]); wax.set_title("seismic", fontsize=7)
     for j, (curve, dt) in enumerate([(RAW_FACIES_CURVE, 2.0), (FACIES_CURVE, 2.0)]):
         for tv, fv in zip(tr[sel], c[curve][sel]):
             if np.isfinite(fv) and fv > 0:
@@ -172,7 +185,7 @@ for ax, (name, (il, xl, t, f)) in zip(axes, wells.items()):
         ax.add_patch(plt.Rectangle((3.1, tv - dt_ms / 2), 0.85, dt_ms, color=fac_cmap(fv), lw=0))
     ax.axhline(top[il[0], xl[0]], color="r", lw=1); ax.axhline(base[il[0], xl[0]], color="r", lw=1)
     ax.set_xlim(0, 4); ax.set_ylim(hi, lo); ax.set_title(name)
-    ax.set_xticks([0.5, 1.55, 2.55, 3.55], ["seismic\ntrace", "raw\nlog", "upscaled\nlog", f"on seismic\n{dt_ms:g} ms"], fontsize=8)
+    ax.set_xticks([1.55, 2.55, 3.55], ["raw\nlog", "upscaled\nlog", f"on seismic\n{dt_ms:g} ms"], fontsize=8)
     ax.set_ylabel("TWT (ms)")
 counts.T.plot.barh(stacked=True, ax=axes[-1], color=[fac_cmap(i) for i in range(n_fac)], legend=False)
 axes[-1].set(title="Calibration samples per well (zone)", xlabel="samples at the seismic rate")
@@ -181,8 +194,9 @@ sp.facies_legend(fig, [FACIES_NAMES[c] for c in all_codes], sp.facies_cmap(all_c
 plt.tight_layout(rect=(0, 0.05, 1, 1)); plt.show()
 """)
 md(r"""
-*How to read it:* for each well, the seismic trace at the well, then the raw facies log, the upscaled log, and the
-facies actually used, one per seismic sample. Red lines mark the zone top and base. Thin raw-log beds (tuff,
+*How to read it:* for each well, the seismic around the well as wiggles (7 traces along the crossline; the red line
+marks the well trace), then the raw facies log, the upscaled log, and the facies actually used, one per seismic
+sample. Red lines mark the zone top and base. Thin raw-log beds (tuff,
 carbonaceous) disappear at seismic scale: they are real, but below seismic resolution. Right, how many calibration
 samples each well contributes per facies. Small counts mean noisy per-facies scores.
 """)
@@ -370,38 +384,43 @@ PCs for scale), and the PCs up to 70% for SOM2.0.
 # =====================================================================================================
 md(r"""
 ## 6 · The self-organising maps
-Each SOM is an 8 × 8 grid of prototype vectors, or nodes. Every zone sample is assigned to its best-matching
-node. Neighbouring nodes hold similar prototypes, so the node colours below are chosen to vary smoothly across the
-grid.
+Each SOM (Kohonen map) is 64 neurons on a **hexagonal** 8 × 8 map: each neuron is a prototype vector with six
+neighbours. Every zone sample is assigned to its best-matching neuron. Training pulls neighbouring neurons
+together, so neighbours hold similar prototypes. The neuron colours below vary smoothly across the map, and the
+numbers identify each neuron.
 """)
 code(r"""
 nodes_rgb = som2.node_colours(SOM_SHAPE)
 fig, ax = plt.subplots(2, 3, figsize=(13, 8.5))
 for r, (name, W, b) in enumerate([("SOM1.0", W1, b1), (NAME2, W2, b2)]):
     hits = np.bincount(b, minlength=W.shape[0])
-    sp.node_grid(ax[r, 0], hits / hits.sum() * 100, SOM_SHAPE, "Greens", f"{name}: % of zone samples per node", fmt=lambda v: f"{v:.1f}")
+    sp.node_grid(ax[r, 0], hits / hits.sum() * 100, SOM_SHAPE, "Greens", f"{name}: % of zone samples per neuron", fmt=lambda v: f"{v:.1f}")
     sp.node_grid(ax[r, 1], sp.u_matrix(W, SOM_SHAPE), SOM_SHAPE, "bone_r", f"{name}: U-matrix (dark = cluster boundary)")
-    sp.node_grid(ax[r, 2], None, SOM_SHAPE, colors=nodes_rgb, title="node colour key")
+    sp.neuron_key(ax[r, 2], SOM_SHAPE, nodes_rgb, title="neuron number and colour")
 plt.tight_layout(); plt.show()
 """)
 md(r"""
 *How to read it:*
-- **Left, hit map:** how many samples each node captures. A few very full nodes and many empty ones means the map
-  is poorly used.
+- **Left, hit map:** how many samples each neuron captures. A few very full neurons and many empty ones means the
+  map is poorly used.
 - **Middle, U-matrix:** the distance between neighbouring prototypes. Dark ridges separate natural clusters in the
   data.
-- **Right:** the colour each node is drawn with in the next figure.
+- **Right:** each neuron's number and the colour it is drawn with on the sections below.
 """)
 code(r"""
-fig, ax = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
-for a, (name, b) in zip(ax, [("SOM1.0", b1), (NAME2, b2)]):
+fig, ax = plt.subplots(2, 2, figsize=(17, 8), gridspec_kw={"width_ratios": [4.2, 1]})
+for r, (name, b) in enumerate([("SOM1.0", b1), (NAME2, b2)]):
+    a = ax[r, 0]
     a.imshow(sp.rgb_line(nodes_rgb[b] / 255, zone_index, path, t0, t1), aspect="auto", extent=[0, len(path), twt[t1 - 1], twt[t0]])
-    sp.decorate_line(a, trange, well_pos, top, base, path); a.set_title(f"{name}: unsupervised SOM classes (64 nodes; no wells used yet)", loc="left", fontsize=9)
+    sp.decorate_line(a, trange, well_pos, top, base, path)
+    a.set_title(f"{name}: every sample coloured by its winning neuron (64 neurons; no wells used yet)", loc="left", fontsize=9)
+    sp.neuron_key(ax[r, 1], SOM_SHAPE, nodes_rgb, title="neuron key")
 plt.tight_layout(); plt.show()
 """)
 md(r"""
-*How to read it:* this is the raw, unsupervised result, before any well information. Similar colours mean similar
-nodes. SOM2.0 classes follow layers and change smoothly along them. SOM1.0 classes flicker from sample to sample,
+*How to read it:* the raw, unsupervised result before any well information. Every sample shows the colour of
+the neuron it maps to (key on the right), so each neuron can be followed through the section. Similar colours mean
+neighbouring, similar neurons. SOM2.0 classes follow layers and change smoothly along them. SOM1.0 classes flicker from sample to sample,
 because its features change with every wavelet loop.
 """)
 
@@ -418,25 +437,26 @@ facies.
 code(r"""
 zi_all, fa_all = som2.calibration_samples(wells, zone_index, CAL_RADIUS)
 calib = {}
-fig, ax = plt.subplots(2, 3, figsize=(15, 9.5))
+fig, ax = plt.subplots(2, 3, figsize=(18, 11))
 for r, (name, b) in enumerate([("SOM1.0", b1), (NAME2, b2)]):
     cnt, win, post = som2.calibrate(b[zi_all], fa_all, SOM_SHAPE[0] * SOM_SHAPE[1], n_fac, SOM_SHAPE)
     calib[name] = post
-    sp.node_facies_bars(ax[r, 0], cnt, SOM_SHAPE, fac_cmap, f"{name}: well samples per node (hatched = none)")
-    sp.node_grid(ax[r, 1], None, SOM_SHAPE, colors=np.where((win >= 0)[:, None], np.array([fac_cmap(max(w, 0))[:3] for w in win]) * 255, 255),
-                 title=f"{name}: biggest winner (white = unknown)")
+    sp.node_facies_bars(ax[r, 0], cnt, SOM_SHAPE, fac_cmap, f"{name}: well samples per neuron (hatched = none)")
+    sp.facies_topology(ax[r, 1], cnt, post, SOM_SHAPE, fac_cmap, fac_names, f"{name}: winning facies topology")
     oil = code_to_k.get(4)
     if oil is not None:
-        sp.node_grid(ax[r, 2], post[:, oil], SOM_SHAPE, "YlOrBr", f"{name}: P(oil sand | node)", vmin=0, vmax=1, fmt=lambda v: f"{v:.2f}")
+        sp.node_grid(ax[r, 2], post[:, oil], SOM_SHAPE, "YlOrBr", f"{name}: P(oil sand | neuron)", vmin=0, vmax=1, fmt=lambda v: f"{v:.2f}")
 sp.facies_legend(fig, fac_names, fac_cmap, y=-0.01); plt.tight_layout(rect=(0, 0.04, 1, 1)); plt.show()
 """)
 md(r"""
 *How to read it:*
 - **Left:** the facies mix of the well samples landing in each node, with the number of samples. Hatched nodes saw
   no well data.
-- **Middle:** the biggest-winner facies per node. With only a few wells, many nodes stay unknown (white).
-- **Right:** the probabilistic calibration's oil-sand probability per node. A good map concentrates it in a compact
-  group of neighbouring nodes.
+- **Middle, winning facies topology:** each neuron's most probable facies, with its number and probability. Paler
+  means less certain. White neurons saw no well data, so their facies is inferred from their neighbours. A good map
+  has each facies in one connected patch of neurons.
+- **Right:** the oil-sand probability per neuron. A good map concentrates it in a compact group of neighbouring
+  neurons.
 """)
 
 # =====================================================================================================
@@ -508,26 +528,29 @@ for r, (name, b) in enumerate([("SOM1.0", b1), (best2, b2)]):
     ax[2 * r + 1].set_title(f"{name}: confidence (probability of the most likely facies; dark blue = low, yellow = high)", loc="left", fontsize=9)
 for a in ax:
     sp.decorate_line(a, trange, well_pos, top, base, path, label=(a is ax[0]))
+for a in (ax[0], ax[2]):
+    sp.well_strips(a, {n: w for n, w in wells.items() if n in well_pos}, well_pos, twt, fac_cmap, width=5, dt=dt_ms)
 sp.facies_legend(fig, fac_names, fac_cmap); plt.tight_layout(rect=(0, 0.03, 1, 1)); plt.show()
 """)
 md(r"""
-*How to read it:* facies and confidence along the line, calibrated with all wells. Look for geological plausibility:
+*How to read it:* facies and confidence along the line, calibrated with all wells. The narrow outlined columns
+are the well facies logs, for direct comparison. Look for geological plausibility:
 continuous layers, sensible stacking, and an oil-sand body above brine sand. Also check where confidence drops,
 usually at facies boundaries and away from the wells.
 """)
 code(r"""
 oil = code_to_k.get(4, 0)
-t_oil = np.concatenate([twt[w[2][w[3] == oil]] - top[w[0][0], w[1][0]] for w in wells.values() if (w[3] == oil).any()])
-offset = float(np.median(t_oil)) if len(t_oil) else 40.0
+rest = som2.load_horizon(MAP_HORIZON, ilines, xlines, to_ilxl)
+offset = MAP_OFFSET_MS
 fig, ax = plt.subplots(1, 3, figsize=(17, 5.2))
 ext = [xlines[0], xlines[-1], ilines[-1], ilines[0]]
 for a, (name, b) in zip(ax[:2], [("SOM1.0", b1), (best2, b2)]):
-    m = sp.horizon_slice(calib[name][b].argmax(1).astype(float), zone_index, top, offset, twt)
+    m = sp.horizon_slice(calib[name][b].argmax(1).astype(float), zone_index, rest, offset, twt)
     a.imshow(m, cmap=fac_cmap, vmin=-0.5, vmax=n_fac - 0.5, extent=ext, aspect="auto", interpolation="nearest")
-    a.set_title(f"{name}: facies {offset:.0f} ms below the top horizon")
-m = sp.horizon_slice(calib[best2][b2][:, oil], zone_index, top, offset, twt)
+    a.set_title(f"{name}: facies {offset:.0f} ms below top reservoir")
+m = np.nanmean([sp.horizon_slice(calib[best2][b2][:, oil], zone_index, rest, o, twt) for o in np.arange(0, MAP_WINDOW_MS + 1, dt_ms)], 0)
 im = ax[2].imshow(m, cmap="YlOrBr", vmin=0, vmax=1, extent=ext, aspect="auto"); plt.colorbar(im, ax=ax[2], label="P(oil sand)")
-ax[2].set_title(f"{best2}: probability of oil sand")
+ax[2].set_title(f"{best2}: mean P(oil sand), top reservoir to +{MAP_WINDOW_MS} ms")
 for a in ax:
     a.plot(xlines[path[:, 1]], ilines[path[:, 0]], "w--", lw=0.8)
     for n, w in wells.items():
@@ -536,8 +559,10 @@ for a in ax:
 sp.facies_legend(fig, fac_names, fac_cmap); plt.tight_layout(rect=(0, 0.06, 1, 1)); plt.show()
 """)
 md(r"""
-*How to read it:* map view on a surface that follows the top horizon at the typical oil-sand level, taken from the
-wells. Look for coherent bodies with plausible shapes and edges, rather than salt-and-pepper noise.
+*How to read it:* map views extracted along the top-reservoir horizon (REST), a couple of samples below it
+because the pick isn't perfect. Left two: the most likely facies for each workflow. Right: SOM2.0's oil-sand
+probability averaged over the top of the reservoir. Look for coherent bodies with plausible shapes and edges,
+rather than salt-and-pepper noise.
 """)
 
 
