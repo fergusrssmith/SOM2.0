@@ -22,9 +22,7 @@ embedding, the two SOMs, well calibration and the blind test.
 
 https://github.com/user-attachments/assets/609f6d13-124f-46d6-a124-0bff67ab8ad6
 
-[![Video: from SOM 1.0 to SOM 2.0](media/SOM_1_to_2_thumb.png)](media/SOM_1_to_2.mp4)
-
-*Click the image to open the video (720p, 8 min). Made with [ManimGL](https://github.com/3b1b/manim).*
+*720p, 8 min; also in [`media/`](media). Made with [ManimGL](https://github.com/3b1b/manim).*
 
 ## Files
 
