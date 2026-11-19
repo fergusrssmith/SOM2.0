@@ -803,10 +803,11 @@ print("facies codes:", {c: FACIES_NAMES.get(c, c) for c in codes}, "| 0 = outsid
 # =====================================================================================================
 md(r"""
 ## 11 · Caveats
-- **Few wells.** Leave-one-well-out with three wells (about 140 samples) gives noisy per-facies recalls, each
-  resting on 10–50 samples. Read the per-well bars as well as the totals.
-- **Attribute set.** SOM1.0 uses the published formulas for standard single-trace and banded attributes, with
-  PCA-based selection. Window lengths and implementation details will differ between software packages.
+- **Few wells.** Leave-one-well-out with five vertical wells (about 250 zone samples at the well traces) gives
+  noisy per-facies recalls; several facies rest on fewer than 40 samples. Read the per-well bars as well as the totals.
+- **Attribute set.** SOM1.0 uses a family-balanced library of standard attributes (no banded attributes), a
+  continuity screen and PCA-based distinct selection. Window lengths and implementation details will differ between
+  software packages.
 - **Thin beds.** Facies thinner than a few milliseconds (tuff, carbonaceous) are below seismic resolution for both
   workflows.
 - **NCS model.** Each embedding vector summarises a 16 × 16-sample patch, so detail finer than about 64 ms vertically
@@ -822,6 +823,19 @@ md(r"""
   embedding PCs. A k-nearest-neighbour classifier on the same PCs scored only slightly above the SOM, so with few
   wells the SOM step itself costs little.
 - **Vertical wells and nearest-trace tie.** Deviated wells need per-sample inline/crossline positions.
+""")
+md(r"""
+## 12 · Video walkthrough
+An 8-minute animated walkthrough of both workflows on this data: attributes and their selection, the NCS
+embedding, the two SOMs, well calibration and the blind test.
+
+[![Video: from SOM 1.0 to SOM 2.0](https://raw.githubusercontent.com/fergusrssmith/SOM2.0/main/media/SOM_1_to_2_thumb.png)](https://github.com/fergusrssmith/SOM2.0/blob/main/media/SOM_1_to_2.mp4)
+
+Click the image to open it on GitHub, or run the next cell to play it here (Colab or Jupyter).
+""")
+code(r"""
+from IPython.display import Video
+Video("https://raw.githubusercontent.com/fergusrssmith/SOM2.0/main/media/SOM_1_to_2.mp4", width=960)
 """)
 code(r"""
 print({k: round(v, 1) for k, v in som2.TIMINGS.items()})

@@ -15,6 +15,17 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
 | Scoring | leave-one-well-out | identical |
 | Output | facies, confidence and P(oil sand) SEG-Y volumes | identical |
 
+## Video walkthrough
+
+An 8-minute animated walkthrough of both workflows on the example data: attributes and their selection, the NCS
+embedding, the two SOMs, well calibration and the blind test.
+
+<!-- inline player: drag media/SOM_1_to_2.mp4 into this README in the GitHub web editor, here -->
+
+[![Video: from SOM 1.0 to SOM 2.0](media/SOM_1_to_2_thumb.png)](media/SOM_1_to_2.mp4)
+
+*Click the image to open the video (720p, 8 min). Made with [ManimGL](https://github.com/3b1b/manim).*
+
 ## Files
 
 - [`som2_workflow.ipynb`](som2_workflow.ipynb): the workflow, step by step. Each step has QC plots and a short
@@ -30,6 +41,7 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
   wells, horizon slices, SOM hit maps, U-matrices and component planes, node calibration views, and confusion matrices.
 - [`tools/make_workflow_notebook.py`](tools/make_workflow_notebook.py): regenerates the notebook.
 - [`requirements.txt`](requirements.txt): Python packages.
+- [`media/`](media): the walkthrough video and its thumbnail.
 
 ## Inputs (kept locally; no data in this repo)
 
