@@ -20,7 +20,7 @@ analysis zone, SOM and well calibration, and both are scored leave-one-well-out.
 An 8-minute animated walkthrough of both workflows on the example data: attributes and their selection, the NCS
 embedding, the two SOMs, well calibration and the blind test.
 
-<!-- inline player: drag media/SOM_1_to_2.mp4 into this README in the GitHub web editor, here -->
+https://github.com/user-attachments/assets/609f6d13-124f-46d6-a124-0bff67ab8ad6
 
 [![Video: from SOM 1.0 to SOM 2.0](media/SOM_1_to_2_thumb.png)](media/SOM_1_to_2.mp4)
 
